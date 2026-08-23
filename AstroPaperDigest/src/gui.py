@@ -25,7 +25,7 @@ from threading import Lock, Thread, Timer
 from urllib.parse import urlencode, urlparse
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
 
@@ -39,7 +39,7 @@ from src import paths as _paths
 _PROJECT_DIR = _paths.data_dir()
 os.chdir(_PROJECT_DIR)
 sys.path.insert(0, str(_PROJECT_DIR))
-load_dotenv(_PROJECT_DIR / ".env")
+load_dotenv(_PROJECT_DIR / ".env", interpolate=False)
 
 from src.digest_parser import parse_digest, get_latest_digest_path, get_digest_path_for_date, get_available_dates
 from src.notifier import load_email_state, send_digest_file, send_test_email
@@ -183,12 +183,11 @@ def _load_config_and_env():
     env_vars = {}
     env_path = os.path.join(_PROJECT_DIR, ".env")
     if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env_vars[k.strip()] = v.strip().strip('"').strip("'")
+        env_vars = {
+            str(key): str(value)
+            for key, value in dotenv_values(env_path, interpolate=False).items()
+            if key is not None and value is not None
+        }
     return cfg, env_vars
 
 
@@ -886,23 +885,30 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str, str]
         _pipeline_process = None
 
 
-def _commit_staged_outputs(staging_dir: str) -> None:
-    """Atomically publish a completed run's staged Digest and BibTeX files."""
+def _commit_staged_outputs(staging_dir: str) -> dict[str, list[str]]:
+    """Atomically publish staged outputs and return their final paths."""
     cfg, env_vars = _load_config_and_env()
     output_cfg = cfg.get("output", {}) or {}
     destinations = {
         "digests": Path(output_cfg.get("digest_dir", "./output/digests")),
         "bibtex": Path(output_cfg.get("bibtex_dir", "./output/bibtex")),
     }
+    published = {kind: [] for kind in destinations}
     root = Path(staging_dir)
     for kind, destination in destinations.items():
         source_dir = root / kind
         if not source_dir.exists():
             continue
+        destination = destination.expanduser()
+        if not destination.is_absolute():
+            destination = _PROJECT_DIR / destination
         destination.mkdir(parents=True, exist_ok=True)
         for source in source_dir.iterdir():
             if source.is_file() and not source.name.endswith(".tmp"):
-                os.replace(source, destination / source.name)
+                target = destination / source.name
+                os.replace(source, target)
+                published[kind].append(str(target))
+    return published
 
 
 def run_pipeline(include_cross: bool = True, include_replacements: bool = True, target_date: str = ""):
@@ -932,6 +938,9 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             cmd.append("--no-cross")
         if not include_replacements:
             cmd.append("--no-replacements")
+        # The child writes into a staging directory. Email is deliberately sent
+        # by this parent only after those files have been published successfully.
+        cmd.append("--no-email")
         if target_date:
             cmd.extend(["--target-date", target_date])
         
@@ -948,14 +957,26 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
             _pipeline_progress.update({"stage": "cancelled"})
             _pipeline_message = "Generation stopped. No new digest was saved."
         elif return_code == 0:
-            _commit_staged_outputs(staging_dir)
+            published_outputs = _commit_staged_outputs(staging_dir) or {}
             clear_date(target_date or _digest_today_str())
             # Locate the digest actually written by this run. Prefer the file
             # for the requested date, then the latest file, then the path the
             # CLI printed (covers custom digest_dir settings).
             digest_path = ""
+            published_digests = [
+                path for path in published_outputs.get("digests", [])
+                if Path(path).name.startswith("digest_") and Path(path).suffix == ".md"
+            ]
             if target_date:
-                digest_path = get_digest_path_for_date(target_date)
+                target_name = f"digest_{target_date}.md"
+                digest_path = next(
+                    (path for path in published_digests if Path(path).name == target_name),
+                    "",
+                )
+            elif published_digests:
+                digest_path = max(published_digests)
+            if target_date:
+                digest_path = digest_path or get_digest_path_for_date(target_date)
             if not digest_path:
                 digest_path = get_latest_digest_path()
             if not digest_path:
@@ -967,6 +988,14 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                     _current_digest = parse_digest(digest_path)
             except Exception:
                 _current_digest = None
+            if digest_path and "=== Done! ===" in stdout:
+                cfg, env_values = _load_config_and_env()
+                if _email_is_configured(cfg, env_values):
+                    _pipeline_message = "Sending email notification..."
+                    if not send_digest_file(digest_path, cfg.get("email", {}) or {}):
+                        _pipeline_log.append(
+                            "Email notification failed; the digest was saved successfully."
+                        )
             _pipeline_status = "done"
             _pipeline_progress.update({"stage": "done", "done": 1, "total": 1})
             # Set contextual message based on result
@@ -3665,6 +3694,7 @@ def setup_submit():
             "zotero_items": summary.get("item_count", 0),
         })
         return redirect(f"/settings?{query}#interests")
+    return redirect("/")
 
 
 @app.route("/settings/save", methods=["POST"])

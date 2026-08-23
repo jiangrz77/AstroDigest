@@ -29,7 +29,7 @@ from src.notifier import send_digest_file  # noqa: E402
 
 
 def main() -> int:
-    load_dotenv(_PROJECT_DIR / ".env")
+    load_dotenv(_PROJECT_DIR / ".env", interpolate=False)
     with open(_PROJECT_DIR / "config.yaml", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     email_config = config.get("email", {})

@@ -13,8 +13,11 @@ from src.gui import (  # noqa: E402
     DIGEST_TEMPLATE,
     _apply_email,
     _deep_link_date,
+    _load_config_and_env,
+    _write_env,
     app,
 )
+from src import gui  # noqa: E402
 
 
 class EmailSettingsTests(unittest.TestCase):
@@ -97,6 +100,39 @@ class EmailSettingsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["ok"])
         send.assert_called_once_with(digest_path, config["email"], force=True)
+
+    def test_quick_profile_setup_redirects_instead_of_returning_500(self):
+        config = {}
+        env_values = {}
+        form = {
+            "provider": "deepseek",
+            "api_key": "test-key",
+            "model": "test-model",
+            "profile_mode": "quick",
+        }
+        with mock.patch("src.gui._load_config_and_env", return_value=(config, env_values)), \
+             mock.patch("src.gui._write_env"), \
+             mock.patch("src.gui._write_config"), \
+             mock.patch("src.gui._refresh_email_environment"):
+            response = self.client.post("/setup", data=form)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+
+    def test_env_credentials_survive_repeated_write_read_cycles(self):
+        original = {
+            "EMAIL_APP_PASSWORD": 'quote" and slash\\ and newline\n and ${HOME}',
+            "CUSTOM_API_KEY": "key\\with\\slashes",
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(gui, "_PROJECT_DIR", tmp):
+            _write_env(original)
+            first = _load_config_and_env()[1]
+            _write_env(first)
+            second = _load_config_and_env()[1]
+
+        self.assertEqual(first, original)
+        self.assertEqual(second, original)
 
 
 if __name__ == "__main__":

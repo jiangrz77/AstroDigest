@@ -80,7 +80,7 @@ def test_starttls_success_sends_message():
 
     assert ok is True
     smtp_cls.assert_called_once_with("mail.cstnet.cn", 587, timeout=30)
-    server.starttls.assert_called_once_with()
+    server.starttls.assert_called_once_with(context=mock.ANY)
     server.login.assert_called_once_with("sender@example.com", "secret")
 
     args = server.sendmail.call_args.args
@@ -109,7 +109,7 @@ def test_ssl_path_skips_starttls():
         ok = send_email("s", "b", cfg)
 
     assert ok is True
-    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30)
+    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30, context=mock.ANY)
     plain_cls.assert_not_called()
     server.starttls.assert_not_called()
     server.login.assert_called_once()
@@ -155,6 +155,7 @@ def test_env_vars_override_config():
 
     assert ok is True
     smtp_cls.assert_called_once_with("env.example.com", 2525, timeout=30)
+    server.starttls.assert_called_once_with(context=mock.ANY)
     server.login.assert_called_once_with("env-sender@example.com", "secret")
     args = server.sendmail.call_args.args
     assert args[0] == "env-sender@example.com"
@@ -180,7 +181,7 @@ def test_default_ssl_when_unspecified():
         ok = send_email("s", "b", cfg)
 
     assert ok is True
-    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30)
+    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30, context=mock.ANY)
     plain_cls.assert_not_called()
     server.starttls.assert_not_called()
     print("  PASSED (defaulted to SMTP_SSL on port 465)")
@@ -201,7 +202,7 @@ def test_smtp_use_ssl_env_override():
         ok = send_email("s", "b", cfg)
 
     assert ok is True
-    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30)
+    ssl_cls.assert_called_once_with("smtp.example.com", 465, timeout=30, context=mock.ANY)
     plain_cls.assert_not_called()
     print("  PASSED (SMTP_USE_SSL=true forced SSL on 465)")
 
@@ -223,6 +224,7 @@ def test_smtp_username_override():
 
     assert ok is True
     smtp_cls.assert_called_once_with("smtp.example.com", 587, timeout=30)
+    server.starttls.assert_called_once_with(context=mock.ANY)
     server.login.assert_called_once_with("rzjiang", "secret")
     args = server.sendmail.call_args.args
     assert args[0] == "sender@example.com"

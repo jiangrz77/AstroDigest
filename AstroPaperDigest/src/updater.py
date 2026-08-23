@@ -10,6 +10,7 @@ All standard-library only - no new dependencies.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import re
@@ -228,14 +229,29 @@ def check_update(repo: str, current: str | None = None) -> dict:
             "error": "A newer version is available on GitHub Releases; in-app "
                      "updates are not enabled for this release channel.",
         }
+    available = is_newer(release["version"], current)
+    expected_sha = str(release.get("sha256") or "").strip().lower()
+    if available and not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        return {
+            "available": False,
+            "current": current,
+            "latest": release["version"],
+            "tag": release["tag"],
+            "notes": release["notes"],
+            "download_url": "",
+            "sha256": None,
+            "published_at": release["published_at"],
+            "error": "The update release does not provide a valid SHA-256 checksum; "
+                     "automatic installation has been disabled for safety.",
+        }
     return {
-        "available": is_newer(release["version"], current),
+        "available": available,
         "current": current,
         "latest": release["version"],
         "tag": release["tag"],
         "notes": release["notes"],
         "download_url": release["download_url"],
-        "sha256": release["sha256"],
+        "sha256": expected_sha or None,
         "published_at": release["published_at"],
         "error": None,
     }
@@ -277,9 +293,10 @@ def sha256_of(path) -> str:
 
 
 def verify_sha256(path, expected: str) -> bool:
-    if not expected:
-        return True
-    return sha256_of(path).lower() == str(expected).strip().lower()
+    expected = str(expected or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return False
+    return hmac.compare_digest(sha256_of(path).lower(), expected)
 
 
 # ---------------------------------------------------------------------------

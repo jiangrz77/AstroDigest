@@ -8,6 +8,7 @@ import json
 import os
 import re
 import smtplib
+import ssl
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -184,13 +185,19 @@ def send_email(
         message.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
+        tls_context = ssl.create_default_context()
         if use_ssl:
-            with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30) as server:
+            with smtplib.SMTP_SSL(
+                smtp_server,
+                smtp_port,
+                timeout=30,
+                context=tls_context,
+            ) as server:
                 server.login(login_user, password)
                 server.sendmail(sender, recipient, message.as_string())
         else:
             with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
-                server.starttls()
+                server.starttls(context=tls_context)
                 server.login(login_user, password)
                 server.sendmail(sender, recipient, message.as_string())
         print(f"  Email sent to {recipient}")

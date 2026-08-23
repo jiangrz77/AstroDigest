@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 # Use absolute path based on script location to work regardless of cwd
 from src import paths as _paths
 _PROJECT_DIR = _paths.data_dir()
-load_dotenv(_PROJECT_DIR / ".env")
+load_dotenv(_PROJECT_DIR / ".env", interpolate=False)
 os.chdir(_PROJECT_DIR)
 
 from src.profile import build_profile, build_profile_from_config, build_profile_from_zotero
@@ -376,7 +376,7 @@ def main():
     # Email notification. The notification intentionally uses the complete
     # scored batch so every 5-star paper can include its full abstract, while
     # lower-rated papers remain available in the desktop App.
-    if not args.no_email:
+    if not args.no_email and not staging_dir:
         email_config = config.get("email", {})
         if email_config.get("enabled", False):
             print("\nSending email notification...")
