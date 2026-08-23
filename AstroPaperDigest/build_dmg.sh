@@ -34,6 +34,7 @@ mkdir -p build dist
 
 echo "==> Building self-contained .app ..."
 "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
+  --argv-emulation \
   --name "$APP_NAME" \
   --osx-bundle-identifier "$BUNDLE_ID" \
   --icon "$APP_ROOT/assets/AppIcon.icns" \
@@ -50,6 +51,13 @@ PLIST="$APP_ROOT/dist/$APP_NAME.app/Contents/Info.plist"
   || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$PLIST"
+
+# Register the deep link used by daily emails.
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string AstroPaperDigest Daily Digest" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string astropaperdigest" "$PLIST" 2>/dev/null || true
 
 echo "==> Ad-hoc signing the .app (no Developer ID required) ..."
 codesign --force --deep -s - "$APP_ROOT/dist/$APP_NAME.app"

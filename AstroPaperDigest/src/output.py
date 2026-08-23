@@ -257,8 +257,8 @@ def write_digest(
     os.replace(temp_digest_path, digest_path)
 
     # Sidecar with full abstracts so the desktop digest page can expand them
-    # ("Show more" / "Show less") without bloating the emailed markdown, which
-    # intentionally keeps the 300-char snippets above.
+    # ("Show more" / "Show less"). The email notification selectively includes
+    # full abstracts for 5-star papers and reads the same sidecar for resends.
     full_abstracts = {}
     for p in papers:
         pid = p.get("id")

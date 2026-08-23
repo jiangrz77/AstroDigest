@@ -62,7 +62,7 @@ echo "Building embedded CLI..."
 
 echo "Building native GUI bundle..."
 "$PYTHON_BIN" -m PyInstaller \
-    --noconfirm --clean --windowed \
+    --noconfirm --clean --windowed --argv-emulation \
     --name "$APP_NAME" \
     --osx-bundle-identifier "$BUNDLE_ID" \
     --icon "$APP_ROOT/assets/AppIcon.icns" \
@@ -83,6 +83,15 @@ PLIST="$APP_DIST/$APP_NAME.app/Contents/Info.plist"
     || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$PLIST"
+
+# Register the deep link used by daily emails.  A click can launch the app
+# when it is closed, or start a second process that hands the URL to the
+# already-running single instance.
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string AstroPaperDigest Daily Digest" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string astropaperdigest" "$PLIST" 2>/dev/null || true
 
 codesign --force --deep -s - "$APP_DIST/$APP_NAME.app"
 cp -R "$APP_DIST/$APP_NAME.app" "$APP_DIR"

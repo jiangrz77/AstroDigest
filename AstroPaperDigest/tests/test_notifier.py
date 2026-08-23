@@ -15,7 +15,12 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.notifier import send_email, send_digest_email  # noqa: E402
+from src.notifier import (  # noqa: E402
+    app_deep_link,
+    send_digest_email,
+    send_digest_notification,
+    send_email,
+)
 
 
 BASE_CONFIG = {
@@ -260,6 +265,140 @@ def test_send_digest_email_defaults_to_today():
     print("  PASSED")
 
 
+def test_daily_notification_contains_full_five_star_abstract_and_thread_headers():
+    print("=== Test: daily notification includes full 5-star abstracts ===")
+    captured = {}
+    papers = [
+        {
+            "id": "2608.12345",
+            "title": "A Five Star Paper",
+            "authors": ["Author One", "Author Two"],
+            "categories": ["astro-ph.GA"],
+            "score": 5,
+            "reason": "Directly relevant to the research profile.",
+            "abstract": "This is the complete abstract, including details beyond the old 300-character email snippet.",
+        },
+        {
+            "id": "2608.12346",
+            "title": "A Four Star Paper",
+            "authors": ["Another Author"],
+            "categories": ["astro-ph.SR"],
+            "score": 4,
+            "reason": "Useful but not a top recommendation.",
+            "abstract": "This paper should remain in the App digest, not the five-star email section.",
+        },
+    ]
+    cfg = dict(BASE_CONFIG)
+
+    def fake_send(subject, body, config, **kwargs):
+        captured.update({"subject": subject, "body": body, "config": config, **kwargs})
+        return True
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp, mock.patch(
+        "src.notifier.send_email", side_effect=fake_send
+    ):
+        state_path = os.path.join(tmp, "email-state.json")
+        ok = send_digest_notification(papers, cfg, "2026-08-23", state_path=state_path)
+
+    assert ok is True
+    assert captured["subject"] == "【AstroPaper Daily】2026-08-23"
+    assert "complete abstract, including details" in captured["body"]
+    assert "A Four Star Paper" not in captured["body"]
+    assert "complete abstract, including details" in captured["html_body"]
+    assert "AstroPaperDigest Daily Digest" in captured["body"]
+    assert "Why recommended:" in captured["body"]
+    assert "There are no 5-star recommendations today." not in captured["body"]
+    assert "astropaperdigest://digest/2026-08-23" in captured["body"]
+    assert "http://127.0.0.1" not in captured["body"]
+    assert "今日" not in captured["body"]
+    assert "五星" not in captured["body"]
+    assert "AstroPaperDigest Daily Digest" in captured["html_body"]
+    assert "Why recommended:" in captured["html_body"]
+    assert ">Open AstroPaperDigest</a>" in captured["html_body"]
+    assert "Open AstroPaperDigest to view the complete digest" not in captured["html_body"]
+    assert "astropaperdigest://digest/2026-08-23" in captured["html_body"]
+    assert "http://127.0.0.1" not in captured["html_body"]
+    assert captured["headers"]["X-AstroPaperDigest-Date"] == "2026-08-23"
+    assert captured["headers"]["Message-ID"]
+    if "References" in captured["headers"]:
+        assert captured["headers"]["References"]
+    assert app_deep_link("2026-08-23") == "astropaperdigest://digest/2026-08-23"
+    print("  PASSED (5-star full abstract + date subject + deep link verified)")
+
+
+def test_daily_notification_deduplicates_and_force_resends_in_same_thread():
+    print("=== Test: daily notification deduplicates by date ===")
+    calls = []
+    papers = [{
+        "id": "2608.99999",
+        "title": "One Paper",
+        "authors": ["Author"],
+        "categories": ["astro-ph.CO"],
+        "score": 5,
+        "reason": "Relevant.",
+        "abstract": "Full abstract.",
+    }]
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp, mock.patch(
+        "src.notifier.send_email",
+        side_effect=lambda subject, body, config, **kwargs: calls.append((subject, kwargs)) or True,
+    ):
+        state_path = os.path.join(tmp, "email-state.json")
+        assert send_digest_notification(papers, BASE_CONFIG, "2026-08-23", state_path=state_path)
+        assert send_digest_notification(papers, BASE_CONFIG, "2026-08-23", state_path=state_path)
+        assert send_digest_notification(papers, BASE_CONFIG, "2026-08-23", force=True, state_path=state_path)
+
+    assert len(calls) == 2
+    assert calls[1][1]["headers"]["In-Reply-To"] == calls[0][1]["headers"]["Message-ID"]
+    print("  PASSED (duplicate skipped; explicit resend threaded)")
+
+
+def test_daily_notification_embeds_native_mathml_without_attachments():
+    print("=== Test: HTML formulas use native MathML without image attachments ===")
+    from email import policy
+    from email.parser import BytesParser
+    import tempfile
+
+    server = _mock_smtp_success()
+    papers = [{
+        "id": "2608.12345",
+        "title": "A Formula Paper",
+        "authors": ["Author"],
+        "categories": ["astro-ph.GA"],
+        "score": 5,
+        "reason": "The $T_{\\rm e}$ and $n_{\\rm e}$ analysis is directly relevant.",
+        "abstract": r"We measure $-4.05\leq\mbox{[Fe/H]}\leq-2.33$ in the sample.",
+    }]
+    with tempfile.TemporaryDirectory() as tmp, mock.patch(
+        "src.notifier.smtplib.SMTP", return_value=server
+    ), mock.patch.dict(os.environ, {"EMAIL_APP_PASSWORD": "secret"}, clear=True):
+        state_path = os.path.join(tmp, "email-state.json")
+        ok = send_digest_notification(papers, BASE_CONFIG, "2026-08-23", state_path=state_path)
+
+    assert ok is True
+    raw = server.sendmail.call_args.args[2].encode("utf-8")
+    parsed = BytesParser(policy=policy.default).parsebytes(raw)
+    assert parsed.get_content_type() == "multipart/alternative"
+    plain_part = parsed.get_payload(0)
+    html_part = parsed.get_payload(1)
+    plain_body = plain_part.get_content()
+    html_body = html_part.get_content()
+    assert "<math " in html_body
+    assert 'xmlns="http://www.w3.org/1998/Math/MathML"' in html_body
+    assert "font-size:1em" in html_body
+    assert r"\mbox" not in html_body
+    assert r"\mbox" in plain_body
+    assert "cid:" not in html_body
+    assert "<img " not in html_body
+    image_parts = [
+        part for part in parsed.walk()
+        if part.get_content_maintype() == "image"
+    ]
+    assert not image_parts
+    print("  PASSED (native MathML present; no formula image attachments)")
+
+
 def _live_send(recipient_override=None):
     """Send a real test email using the project's configured SMTP settings."""
     import yaml
@@ -300,6 +439,9 @@ TESTS = [
     test_smtp_username_override,
     test_send_digest_email_subject_and_passthrough,
     test_send_digest_email_defaults_to_today,
+    test_daily_notification_contains_full_five_star_abstract_and_thread_headers,
+    test_daily_notification_deduplicates_and_force_resends_in_same_thread,
+    test_daily_notification_embeds_native_mathml_without_attachments,
 ]
 
 

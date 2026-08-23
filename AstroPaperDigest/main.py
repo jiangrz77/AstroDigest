@@ -25,8 +25,8 @@ from src.profile import build_profile, build_profile_from_config, build_profile_
 from src.zotero import ZoteroReadError
 from src.fetch_arxiv import fetch_daily_batch
 from src.ranker import APIKeyError, rank_papers
-from src.output import write_bibtex, write_digest, generate_markdown_digest
-from src.notifier import send_digest_email
+from src.output import write_bibtex, write_digest
+from src.notifier import send_digest_notification
 from src.digest_parser import parse_digest, get_latest_digest_path
 from src.progress import emit
 from src.scoring import normalize_threshold
@@ -373,13 +373,14 @@ def main():
     digest_dir = output_cfg.get("digest_dir", "./output/digests")
     digest_path = write_digest(all_papers, digest_dir, threshold, digest_date=arxiv_date)
     
-    # Email notification
+    # Email notification. The notification intentionally uses the complete
+    # scored batch so every 5-star paper can include its full abstract, while
+    # lower-rated papers remain available in the desktop App.
     if not args.no_email:
         email_config = config.get("email", {})
         if email_config.get("enabled", False):
             print("\nSending email notification...")
-            digest_content = generate_markdown_digest(ranked, threshold)
-            send_digest_email(digest_content, email_config)
+            send_digest_notification(all_papers, email_config, date_str=arxiv_date)
     
     print("\n=== Done! ===")
     emit("done", 1, 1, "All done")

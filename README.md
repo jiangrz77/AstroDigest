@@ -11,7 +11,14 @@ Automatically fetches, filters, and ranks daily astrophysics papers based on you
 - **Setup wizard**: First-launch wizard for API key and research interests
 - **Zotero library**: Read a local Zotero database directly to build the research profile
 - **Dual output**: BibTeX entries + Markdown digest, organized by date
+- **Email notifications**: sends `【AstroPaper Daily】date` after each successful update, including all 5-star recommendations with full abstracts
 - **macOS app**: Double-click to run, opens a native desktop window
+
+## Email notifications
+
+Enable email in **Settings → Email Notification** and provide your SMTP settings. After a successful daily digest update, AstroPaperDigest sends one email for that date. The message includes every 5-star paper with its title, score, reason, authors, categories, arXiv link, and full abstract; lower-rated papers remain available in the App. A message is still sent when there are no 5-star papers.
+
+Daily sends are deduplicated by date. Use **Resend Latest Digest** in Settings or run `send_digests.py --resend YYYY-MM-DD` for an explicit resend. Messages include both HTML and plain-text parts and threading headers to help mailbox clients display the updates as one series. The App link uses the `astropaperdigest://` macOS URL scheme so it can launch the App and open the requested date when the App is not already running.
 
 ## Quick Start
 

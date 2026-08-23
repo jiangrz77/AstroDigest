@@ -22,9 +22,10 @@ from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, Timer
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request
+from dotenv import load_dotenv
 from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
 
@@ -38,8 +39,10 @@ from src import paths as _paths
 _PROJECT_DIR = _paths.data_dir()
 os.chdir(_PROJECT_DIR)
 sys.path.insert(0, str(_PROJECT_DIR))
+load_dotenv(_PROJECT_DIR / ".env")
 
 from src.digest_parser import parse_digest, get_latest_digest_path, get_digest_path_for_date, get_available_dates
+from src.notifier import load_email_state, send_digest_file, send_test_email
 from src import updater
 from src.preference_learning import (
     ensure_learned_profile,
@@ -88,6 +91,7 @@ _pipeline_lock = Lock()
 _desktop_window = None
 _server = None
 _run_lock_fh = None
+_pending_open_date = ""
 
 # Single-instance + run-info location.  fcntl.flock releases automatically on
 # process exit, so a crashed app never leaves a "live" lock behind.
@@ -198,6 +202,33 @@ def _write_env(env_values: dict) -> None:
     os.chmod(env_path, 0o600)
 
 
+def _refresh_email_environment(env_values: dict) -> None:
+    """Make newly saved email settings available to this GUI process."""
+    for key in (
+        "EMAIL_APP_PASSWORD",
+        "EMAIL_SENDER",
+        "EMAIL_RECIPIENT",
+        "SMTP_SERVER",
+        "SMTP_PORT",
+    ):
+        value = env_values.get(key)
+        if value:
+            os.environ[key] = value
+
+
+def _email_is_configured(config: dict, env_values: dict = None) -> bool:
+    """Return whether the saved email settings are ready for a manual send."""
+    email_cfg = config.get("email", {}) or {}
+    if not email_cfg.get("enabled", False):
+        return False
+    env_values = env_values or {}
+    password_env = str(email_cfg.get("password_env", "EMAIL_APP_PASSWORD"))
+    sender = env_values.get("EMAIL_SENDER") or email_cfg.get("sender")
+    recipient = env_values.get("EMAIL_RECIPIENT") or email_cfg.get("recipient")
+    password = env_values.get(password_env) or os.environ.get(password_env)
+    return bool(sender and recipient and password)
+
+
 def _write_config(config: dict) -> None:
     """Write config.yaml, preserving key order and unicode."""
     import yaml
@@ -306,12 +337,16 @@ def _save_display_categories(categories) -> list:
 
 
 def _apply_email(config: dict, env_values: dict, enable_email: bool,
-                 email_sender: str, email_recipient: str, smtp_server: str,
+                 email_address: str, smtp_server: str,
                  smtp_protocol: str, smtp_port_value: str,
                  email_password: str) -> None:
     """Update email config + credentials; never wipe stored values when off."""
     smtp_port = 465 if smtp_protocol == "ssl" else 587
     if enable_email:
+        if not email_address:
+            abort(400, "Send/receive email is required when email notification is enabled.")
+        if not smtp_server:
+            abort(400, "SMTP server is required when email notification is enabled.")
         try:
             smtp_port = int(smtp_port_value) if smtp_port_value else smtp_port
         except ValueError:
@@ -320,17 +355,22 @@ def _apply_email(config: dict, env_values: dict, enable_email: bool,
             abort(400, "SMTP port must be between 1 and 65535.")
 
     if enable_email:
-        env_values["EMAIL_APP_PASSWORD"] = email_password
-        env_values["EMAIL_SENDER"] = email_sender
-        env_values["EMAIL_RECIPIENT"] = email_recipient or email_sender
+        # A blank password means "keep the previously saved app password".
+        # The settings page never sends the stored secret back to the browser.
+        if email_password:
+            env_values["EMAIL_APP_PASSWORD"] = email_password
+        if not env_values.get("EMAIL_APP_PASSWORD"):
+            abort(400, "Email app password is required the first time email is enabled.")
+        env_values["EMAIL_SENDER"] = email_address
+        env_values["EMAIL_RECIPIENT"] = email_address
         env_values["SMTP_SERVER"] = smtp_server
         env_values["SMTP_PORT"] = str(smtp_port)
 
     email_cfg = config.setdefault("email", {})
-    if enable_email and email_sender and smtp_server:
+    if enable_email and email_address and smtp_server:
         email_cfg["enabled"] = True
-        email_cfg["sender"] = email_sender
-        email_cfg["recipient"] = email_recipient or email_sender
+        email_cfg["sender"] = email_address
+        email_cfg["recipient"] = email_address
         email_cfg["smtp_server"] = smtp_server
         email_cfg["use_ssl"] = (smtp_protocol == "ssl")
         email_cfg["smtp_port"] = smtp_port
@@ -365,11 +405,14 @@ def _setup_context() -> dict:
         "zotero_feedback": None,
         "cur_email_sender": email_cfg.get("sender", ""),
         "cur_email_recipient": email_cfg.get("recipient", ""),
+        "cur_email_address": email_cfg.get("sender", "") or email_cfg.get("recipient", ""),
         "cur_smtp_server": email_cfg.get("smtp_server", ""),
         "cur_smtp_port": str(email_cfg.get("smtp_port", "465")),
         "cur_use_ssl": email_cfg.get("use_ssl", True),
         "cur_email_enabled": email_cfg.get("enabled", False),
-        "cur_email_password": env_vars.get("EMAIL_APP_PASSWORD", ""),
+        "cur_email_password": "",
+        "cur_email_password_saved": bool(env_vars.get("EMAIL_APP_PASSWORD")),
+        "cur_email_last_sent": load_email_state().get("last_message_id", ""),
     }
 
 
@@ -566,6 +609,47 @@ def _focus_existing_instance() -> bool:
     return False
 
 
+def _deep_link_date(value: str) -> str:
+    """Extract a YYYY-MM-DD target from astropaperdigest://digest/<date>."""
+    try:
+        parsed = urlparse(str(value).strip())
+        if parsed.scheme != "astropaperdigest" or parsed.netloc != "digest":
+            return ""
+        target = parsed.path.strip("/")
+        date.fromisoformat(target)
+        return target
+    except (TypeError, ValueError):
+        return ""
+
+
+def _deep_link_from_args(values) -> str:
+    for value in values:
+        target = _deep_link_date(value)
+        if target:
+            return target
+    return ""
+
+
+def _open_existing_instance(date_str: str = "") -> bool:
+    """Ask the running instance to focus and optionally open a digest date."""
+    import urllib.request
+
+    for _ in range(15):
+        info = _read_run_info()
+        port = info.get("port") if info else None
+        if port:
+            try:
+                path = "/open"
+                if date_str:
+                    path += "?" + urlencode({"date": date_str})
+                urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=2).read()
+                return True
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return False
+
+
 def _handle_termination_signal(signum, frame):
     """Release the port and run files when macOS/launcher sends SIGTERM/SIGINT."""
     try:
@@ -588,6 +672,33 @@ def focus_desktop_window():
             window.show()
         except Exception:
             pass
+    return "", 204
+
+
+@app.route("/open", methods=["GET", "POST"])
+def open_digest_from_link():
+    """Focus the window and navigate it to a date requested by a deep link."""
+    target = request.args.get("date", "").strip()
+    if target:
+        try:
+            date.fromisoformat(target)
+        except ValueError:
+            abort(400, "Date must use YYYY-MM-DD format.")
+    window = _desktop_window
+    if window is not None:
+        try:
+            window.restore()
+        except Exception:
+            pass
+        try:
+            window.show()
+        except Exception:
+            pass
+        if target and _server is not None:
+            try:
+                window.load_url(f"http://127.0.0.1:{_server.server_port}/digest/{target}")
+            except Exception:
+                pass
     return "", 204
 
 
@@ -777,7 +888,7 @@ def _stream_pipeline(cmd: list[str], timeout: int = 900) -> tuple[int, str, str]
 
 def _commit_staged_outputs(staging_dir: str) -> None:
     """Atomically publish a completed run's staged Digest and BibTeX files."""
-    cfg, _ = _load_config_and_env()
+    cfg, env_vars = _load_config_and_env()
     output_cfg = cfg.get("output", {}) or {}
     destinations = {
         "digests": Path(output_cfg.get("digest_dir", "./output/digests")),
@@ -1003,11 +1114,13 @@ _CALENDAR_SNIPPET = r"""<style>
 .dot-gray{background:#cbd5e1}
 .cal-legend{display:flex;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid #eef0f3;font-size:11px;color:#777;flex-wrap:wrap}
 .cal-legend span{display:inline-flex;align-items:center;gap:5px}
-.cal-hint{font-size:11px;color:#aaa;margin-top:8px;text-align:center}
 </style>
 <script>
 (function () {
   var STATUS = window.APD_DIGEST_STATUS || {};
+  var hasUnscored = Object.keys(STATUS).some(function (key) {
+    return STATUS[key] === 'orange';
+  });
   var todayStr = '';
   var selectedStr = '';
   var viewY = 0, viewM = 0; // viewM is 0-based
@@ -1043,12 +1156,7 @@ _CALENDAR_SNIPPET = r"""<style>
       '</div>' +
       '<div class="cal-week"><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span><span>Su</span></div>' +
       '<div class="cal-grid" id="cal-grid"></div>' +
-      '<div class="cal-legend">' +
-        '<span><i class="dot dot-green"></i>Has content</span>' +
-        '<span><i class="dot dot-orange"></i>Some unscored</span>' +
-        '<span><i class="dot dot-gray"></i>Empty digest</span>' +
-      '</div>' +
-      '<div class="cal-hint">Click a date to open it · click outside or press Esc to close</div>';
+      (hasUnscored ? '<div class="cal-legend"><span><i class="dot dot-orange"></i>Some papers unscored</span></div>' : '');
     document.body.appendChild(pop);
     pop.addEventListener('click', function (e) { e.stopPropagation(); });
     document.getElementById('cal-prev').addEventListener('click', function () {
@@ -1253,16 +1361,15 @@ textarea{height:80px;resize:vertical}
 
   <div class="step">
     <h2><span class="step-num">3</span>Email Notification (Optional)</h2>
-    <label style="display:flex;align-items:center;gap:8px;font-weight:600;color:#999;cursor:not-allowed">
-      <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %} disabled>
+    <label style="display:flex;align-items:center;gap:8px;font-weight:600">
+      <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %}>
       Enable email notification
     </label>
-    <p class="hint">Daily email reminders are still under development. Stay tuned.</p>
+    <p class="hint">After each successful daily update, receive the 5-star recommendations and their full abstracts by email.</p>
     <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
-      <label for="email_sender">Sender Email</label>
-      <input type="text" id="email_sender" name="email_sender" placeholder="you@example.com" value="{{ cur_email_sender or '' }}">
-      <label for="email_recipient">Recipient Email</label>
-      <input type="text" id="email_recipient" name="email_recipient" placeholder="you@example.com" value="{{ cur_email_recipient or '' }}">
+      <label for="email_address">Send/Receive Email</label>
+      <input type="text" id="email_address" name="email_address" placeholder="you@example.com" value="{{ cur_email_address or '' }}">
+      <p class="hint">This address is used for both sending and receiving the daily digest.</p>
       <label for="smtp_server">SMTP Server</label>
       <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
       <label for="smtp_protocol">Protocol</label>
@@ -1273,7 +1380,7 @@ textarea{height:80px;resize:vertical}
       <label for="smtp_port">Port (optional, auto-filled)</label>
       <input type="text" id="smtp_port" name="smtp_port" placeholder="465" value="{{ cur_smtp_port or '465' }}">
       <label for="email_password">Email Password / App Password</label>
-      <input type="password" id="email_password" name="email_password" placeholder="App password" value="{{ cur_email_password or '' }}">
+      <input type="password" id="email_password" name="email_password" placeholder="{% if cur_email_password_saved %}Leave blank to keep the saved App Password{% else %}App password{% endif %}" value="">
     </div>
   </div>
 
@@ -1555,11 +1662,33 @@ textarea{height:90px;resize:vertical}
     <section class="panel" id="panel-email">
       <div class="card">
         <h2>Email Notification</h2>
-        <p class="sub">Daily email reminders for new papers.</p>
-        <div class="notice">Email notification is under development and currently disabled. Stay tuned.</div>
-        <label class="check-line" style="margin-top:16px;color:#999;cursor:not-allowed">
-          <input type="checkbox" disabled> Enable email notification
+        <p class="sub">Receive one daily email after a successful digest update. The message includes every 5-star paper with its full abstract; the complete digest remains in the App.</p>
+        <label class="check-line" style="margin-top:16px">
+          <input type="checkbox" id="enable_email" name="enable_email" onchange="toggleEmail()" {% if cur_email_enabled %}checked{% endif %}>
+          Enable email notification
         </label>
+        <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
+          <label for="email_address">Send/Receive Email</label>
+          <input type="text" id="email_address" name="email_address" placeholder="you@example.com" value="{{ cur_email_address or '' }}">
+          <p class="hint">This address is used for both sending and receiving the daily digest.</p>
+          <label for="smtp_server">SMTP Server</label>
+          <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
+          <label for="smtp_protocol">Protocol</label>
+          <select id="smtp_protocol" name="smtp_protocol" onchange="updatePort()">
+            <option value="starttls" {% if not cur_use_ssl %}selected{% endif %}>STARTTLS (port 587)</option>
+            <option value="ssl" {% if cur_use_ssl %}selected{% endif %}>SSL (port 465)</option>
+          </select>
+          <label for="smtp_port">Port</label>
+          <input type="text" id="smtp_port" name="smtp_port" placeholder="465" value="{{ cur_smtp_port or '465' }}">
+          <label for="email_password">Email Password / App Password</label>
+          <input type="password" id="email_password" name="email_password" placeholder="{% if cur_email_password_saved %}Leave blank to keep the saved App Password{% else %}App password{% endif %}" value="">
+          <p class="hint">The password is stored locally in the App support directory and is never displayed back here.</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-secondary" type="button" id="btn-test-email">Send Test Email</button>
+          <button class="btn btn-secondary" type="button" id="btn-resend-email">Resend Latest Digest</button>
+        </div>
+        <p class="update-status" id="email-status">{% if cur_email_last_sent %}Daily email history is available.{% else %}No daily email has been sent yet.{% endif %}</p>
       </div>
     </section>
 
@@ -1614,6 +1743,49 @@ toggleProfileMode();
     document.getElementById('baseurl-group').style.display = 'block';
   }
 })();
+function updatePort() {
+  const protocol = document.getElementById('smtp_protocol');
+  const port = document.getElementById('smtp_port');
+  if (protocol && port) {
+    port.value = protocol.value === 'ssl' ? '465' : '587';
+    if (window.markSettingsDirty) window.markSettingsDirty();
+  }
+}
+function toggleEmail() {
+  const checkbox = document.getElementById('enable_email');
+  const fields = document.getElementById('email-fields');
+  if (!checkbox || !fields) return;
+  fields.style.display = checkbox.checked ? '' : 'none';
+  fields.querySelectorAll('input, select').forEach(function (field) {
+    field.disabled = !checkbox.checked;
+  });
+  if (window.markSettingsDirty) window.markSettingsDirty();
+}
+function emailAction(url, message) {
+  const status = document.getElementById('email-status');
+  if (status) status.textContent = message;
+  fetch(url, {method: 'POST', cache: 'no-store'})
+    .then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (data) {
+        return {ok: response.ok && data.ok, data: data};
+      });
+    })
+    .then(function (result) {
+      if (status) status.textContent = result.data.message || result.data.error || (result.ok ? 'Done.' : 'Email action failed.');
+    })
+    .catch(function () {
+      if (status) status.textContent = 'Email action failed. Check the App log.';
+    });
+}
+toggleEmail();
+const testEmailButton = document.getElementById('btn-test-email');
+if (testEmailButton) testEmailButton.addEventListener('click', function () {
+  emailAction('/email/test', 'Sending test email…');
+});
+const resendEmailButton = document.getElementById('btn-resend-email');
+if (resendEmailButton) resendEmailButton.addEventListener('click', function () {
+  if (confirm('Resend the latest digest email now?')) emailAction('/email/resend', 'Resending latest digest…');
+});
 </script>
 <script>
 (function () {
@@ -2233,16 +2405,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .btn-order-refresh{position:fixed;right:24px;bottom:24px;z-index:120;width:48px;height:48px;padding:0;border:1px solid #93c5fd;border-radius:50%;background:#fff;color:#2563eb;font-size:24px;font-weight:600;line-height:1;cursor:pointer;box-shadow:0 4px 14px rgba(37,99,235,.22);transition:background .16s ease,transform .16s ease,box-shadow .16s ease}
 .btn-order-refresh:hover{background:#eff6ff;transform:translateY(-2px);box-shadow:0 7px 18px rgba(37,99,235,.28)}
 .btn-order-refresh:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:2px}
-.filter-menu{position:relative;margin-left:auto}
-.search-control{position:relative;display:inline-flex;align-items:center}
-.search-control input{width:210px;height:36px;box-sizing:border-box;padding:0 68px 0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;line-height:1;outline:none}
-.search-control input::placeholder{color:#94a3b8}
-.search-control input:focus{border-color:#93c5fd;box-shadow:0 0 0 2px rgba(147,197,253,.25)}
-.search-control input::-webkit-search-cancel-button{display:none}
-.search-clear{position:absolute;right:7px;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;border-radius:50%;background:transparent;color:#64748b;font-size:18px;line-height:1;cursor:pointer}
+.toolbar-actions{display:flex;align-items:center;gap:8px;margin-left:auto;min-width:0;flex:0 0 auto}
+.toolbar-toast{position:fixed;top:132px;right:24px;z-index:150;max-width:min(360px,calc(100vw - 48px));padding:10px 14px;border:1px solid #bfdbfe;border-radius:8px;background:#eff6ff;color:#1e3a5f;font-size:13px;box-shadow:0 6px 18px rgba(15,23,42,.12)}
+.toolbar-toast.error{border-color:#fecaca;background:#fef2f2;color:#991b1b}
+.toolbar-toast[hidden]{display:none}
+.toolbar button.toolbar-icon{position:relative;display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;min-width:36px;flex:0 0 36px;padding:0;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;color:#334155;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.06)}
+.toolbar-icon:hover,.toolbar-icon[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
+.toolbar-icon svg{display:block;width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.toolbar-icon:focus-visible{outline:2px solid #93c5fd;outline-offset:2px}
+.search-control{position:relative;display:inline-flex;align-items:center;min-width:0}
+.search-expanded{display:inline-flex;align-items:center;width:min(340px,42vw);height:36px;min-width:0;padding:0 4px 0 10px;border:1px solid #93c5fd;border-radius:8px;background:#fff;box-shadow:0 0 0 2px rgba(147,197,253,.25)}
+.search-expanded[hidden]{display:none}
+.search-expanded input{width:100%;min-width:0;height:32px;padding:0 4px;border:0;outline:none;background:transparent;color:#334155;font-size:13px;line-height:1;text-overflow:ellipsis}
+.search-expanded input::placeholder{color:#94a3b8}
+.search-expanded input::-webkit-search-cancel-button{display:none}
+.search-clear{position:static;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:0 0 22px;padding:0;border:0;border-radius:50%;background:transparent;color:#64748b;font-size:18px;line-height:1;cursor:pointer}
 .search-clear:hover{background:#f1f5f9;color:#334155}
 .search-clear[hidden]{display:none}
-.search-nav-buttons{position:absolute;right:31px;display:inline-flex;align-items:center;gap:0}
+.search-nav-buttons{position:static;display:inline-flex;align-items:center;gap:0;flex:0 0 auto;margin-left:2px}
 .search-nav-buttons[hidden],#search-nav-buttons[hidden]{display:none!important}
 .search-nav-button{display:inline-flex;align-items:center;justify-content:center;width:13px;height:18px;padding:0;border:0;border-radius:3px;background:transparent;color:#64748b;font-size:11px;line-height:1;cursor:pointer}
 .search-nav-button:hover{background:#f1f5f9;color:#1d4ed8}
@@ -2250,11 +2430,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .search-nav-button:focus-visible{outline:2px solid #93c5fd;outline-offset:1px}
 .search-match{background:#ffd54f!important;color:#1f2937!important;border-radius:3px;padding:0 2px;box-shadow:0 0 0 1px rgba(180,130,0,.18)}
 .search-current{outline:2px solid #93c5fd;outline-offset:3px;box-shadow:0 0 0 5px rgba(147,197,253,.16)}
-.btn-filter{height:36px;display:flex;align-items:center;gap:7px;padding:0 11px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#334155;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}
-.btn-filter:hover,.btn-filter[aria-expanded="true"]{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
-.filter-summary{color:#64748b;font-size:12px;font-weight:500}
-.filter-chevron{display:inline-block;flex:0 0 auto;width:8px;height:8px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);transition:transform .16s ease}
-.btn-filter[aria-expanded="true"] .filter-chevron{transform:rotate(225deg)}
+.filter-menu{position:relative}
+.btn-filter{margin:0}
+.filter-active-dot{position:absolute;top:5px;right:5px;width:6px;height:6px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 2px #fff}
+.filter-active-dot[hidden]{display:none}
+.filter-summary,.filter-chevron{display:none}
 .filter-popover{position:absolute;z-index:20;right:0;top:calc(100% + 8px);width:344px;padding:14px;border:1px solid #dbe3ee;border-radius:10px;background:#fff;box-shadow:0 12px 28px rgba(15,23,42,.16)}
 .filter-popover[hidden]{display:none}
 .filter-section+.filter-section{margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb}
@@ -2277,7 +2457,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .scope-toggle span{display:flex;align-items:center;justify-content:center;min-height:34px;padding:0 9px;border:1px solid #d1d5db;border-radius:7px;background:#fff;color:#475569;font-size:12px;font-weight:600;text-align:center;transition:background .14s ease,border-color .14s ease,color .14s ease}
 .scope-toggle:hover span{border-color:#93c5fd;color:#1d4ed8}
 .scope-toggle input:checked+span{border-color:#1d4ed8;background:#dbeafe;color:#1d4ed8}
-@media(max-width:760px){.filter-menu{margin-left:0}.search-control input{width:190px}.filter-popover{left:0;right:auto;max-width:calc(100vw - 32px)}}
+@media(max-width:760px){.toolbar-actions{margin-left:0}.search-expanded{width:min(300px,calc(100vw - 32px))}.filter-popover{left:0;right:auto;max-width:calc(100vw - 32px)}}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
@@ -2309,17 +2489,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <button class="btn-refresh" onclick="rerunWithPrefs()" title="Regenerate digest">Regenerate</button>
   <span class="paper-total stats" aria-label="Displayed paper count">{{ digest.total_papers }} papers</span>
   {% for star in (5, 4, 3, 2, 1) %}<button class="btn-nav btn-nav-star nav-star-{{ star }}" data-score-nav="{{ star }}" aria-label="{{ star }}-star papers" onclick="scrollToScore({{ star }})">{{ '★' * star }} (<span class="btn-score-count">{{ score_counts.get(star, 0) }}</span>)</button>{% endfor %}
+  <div class="toolbar-actions">
   <div class="search-control" id="search-control">
-    <input type="search" id="digest-search" placeholder="Search papers" aria-label="Search papers by title, author, abstract, arXiv ID, or category">
-    <div class="search-nav-buttons" id="search-nav-buttons" aria-label="Search result navigation" hidden>
-      <button class="search-nav-button" id="search-prev" type="button" aria-label="Previous matching paper" title="Previous match (Shift+Enter)" disabled>&#8593;</button>
-      <button class="search-nav-button" id="search-next" type="button" aria-label="Next matching paper" title="Next match (Enter)" disabled>&#8595;</button>
+    <button class="toolbar-icon" id="search-trigger" type="button" aria-label="Search papers" title="Search papers">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 5 5"></path></svg>
+    </button>
+    <div class="search-expanded" id="search-expanded" hidden>
+      <input type="search" id="digest-search" placeholder="Search papers" aria-label="Search papers by title, author, abstract, arXiv ID, or category">
+      <div class="search-nav-buttons" id="search-nav-buttons" aria-label="Search result navigation" hidden>
+        <button class="search-nav-button" id="search-prev" type="button" aria-label="Previous matching paper" title="Previous match (Shift+Enter)" disabled>&#8593;</button>
+        <button class="search-nav-button" id="search-next" type="button" aria-label="Next matching paper" title="Next match (Enter)" disabled>&#8595;</button>
+      </div>
+      <button class="search-clear" id="search-clear" type="button" hidden aria-label="Clear search">&times;</button>
     </div>
-    <button class="search-clear" id="search-clear" type="button" hidden aria-label="Clear search">&times;</button>
   </div>
   <div class="filter-menu" id="filter-menu">
-    <button class="btn-filter" type="button" id="filter-trigger" aria-expanded="false" aria-controls="filter-popover">
-      <span>Filters</span><span class="filter-summary" id="filter-summary"></span><span class="filter-chevron" aria-hidden="true"></span>
+    <button class="toolbar-icon btn-filter" type="button" id="filter-trigger" aria-label="Filters" title="Filters" aria-expanded="false" aria-controls="filter-popover">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16l-6.5 7.5v5l-3 1.5v-6.5L4 5z"></path></svg><span class="filter-active-dot" id="filter-active-dot" hidden aria-hidden="true"></span>
     </button>
     <div class="filter-popover" id="filter-popover" hidden>
       <section class="filter-section" aria-label="Categories">
@@ -2342,7 +2528,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       </section>
     </div>
   </div>
+  {% if email_configured %}
+  <button class="toolbar-icon" id="btn-email-current" type="button" aria-label="Email current digest" title="Email current digest">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m4 7 8 6 8-6"></path></svg>
+  </button>
+  {% endif %}
+  </div>
 </div>
+<div class="toolbar-toast" id="toolbar-toast" role="status" aria-live="polite" hidden></div>
 <div class="scope-banner" id="scope-banner" role="status" aria-live="polite">
   <span class="scope-banner-text" id="scope-banner-text"></span>
   <span class="scope-banner-actions">
@@ -2474,13 +2667,34 @@ function setFilterMenuOpen(open) {
 function updateFilterSummary() {
   const selectedCount = document.querySelectorAll('.digest-category:checked').length;
   const totalCount = document.querySelectorAll('.digest-category').length;
-  document.getElementById('filter-summary').textContent = selectedCount + '/' + totalCount + ' categories';
+  const cross = document.getElementById('chk-cross');
+  const replacements = document.getElementById('chk-repl');
+  const active = selectedCount !== totalCount || (cross && !cross.checked) || (replacements && !replacements.checked);
+  const dot = document.getElementById('filter-active-dot');
+  if (dot) dot.hidden = !active;
+  if (filterTrigger) filterTrigger.setAttribute('aria-label', active ? 'Filters (active)' : 'Filters');
 }
+const searchControl = document.getElementById('search-control');
+const searchTrigger = document.getElementById('search-trigger');
+const searchExpanded = document.getElementById('search-expanded');
 const digestSearch = document.getElementById('digest-search');
 const searchClear = document.getElementById('search-clear');
 const searchPrevious = document.getElementById('search-prev');
 const searchNext = document.getElementById('search-next');
 const searchNavButtons = document.getElementById('search-nav-buttons');
+function setSearchOpen(open, focusInput) {
+  if (!searchControl || !searchExpanded || !searchTrigger) return;
+  searchExpanded.hidden = !open;
+  searchTrigger.hidden = open;
+  searchTrigger.setAttribute('aria-expanded', String(open));
+  if (open && focusInput && digestSearch) {
+    window.setTimeout(function () {
+      digestSearch.focus();
+      digestSearch.select();
+    }, 0);
+  }
+}
+if (searchTrigger) searchTrigger.addEventListener('click', function () { setSearchOpen(true, true); });
 function searchTokens() {
   if (!digestSearch) return [];
   return digestSearch.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
@@ -2634,7 +2848,7 @@ if (searchClear) searchClear.addEventListener('click', function () {
   digestSearch.value = '';
   syncSearchControl();
   filterCards();
-  digestSearch.focus();
+  setSearchOpen(false, false);
 });
 function navigateFromSearchButton(direction) {
   goToSearchMatch(direction);
@@ -2642,16 +2856,53 @@ function navigateFromSearchButton(direction) {
 }
 if (searchPrevious) searchPrevious.addEventListener('click', function () { navigateFromSearchButton(-1); });
 if (searchNext) searchNext.addEventListener('click', function () { navigateFromSearchButton(1); });
+const toolbarToast = document.getElementById('toolbar-toast');
+let toolbarToastTimer = null;
+function showToolbarToast(message, isError) {
+  if (!toolbarToast) return;
+  if (toolbarToastTimer) window.clearTimeout(toolbarToastTimer);
+  toolbarToast.textContent = message;
+  toolbarToast.classList.toggle('error', Boolean(isError));
+  toolbarToast.hidden = false;
+  toolbarToastTimer = window.setTimeout(function () { toolbarToast.hidden = true; }, 5000);
+}
+const emailCurrentButton = document.getElementById('btn-email-current');
+if (emailCurrentButton) emailCurrentButton.addEventListener('click', function () {
+  if (emailCurrentButton.disabled) return;
+  if (!confirm('Send this digest by email?')) return;
+  emailCurrentButton.disabled = true;
+  showToolbarToast('Sending digest email…', false);
+  fetch('/email/send-current', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({date: DIGEST_DATE})
+  }).then(function (response) {
+    return response.json().catch(function () { return {}; }).then(function (data) {
+      return {ok: response.ok && data.ok, data: data};
+    });
+  }).then(function (result) {
+    showToolbarToast(
+      result.data.message || result.data.error || (result.ok ? 'Digest email sent.' : 'Digest email send failed.'),
+      !result.ok
+    );
+  }).catch(function () {
+    showToolbarToast('Digest email send failed. Check the App log.', true);
+  }).finally(function () {
+    emailCurrentButton.disabled = false;
+  });
+});
 filterTrigger.addEventListener('click', function () {
   setFilterMenuOpen(filterPopover.hidden);
 });
 document.addEventListener('click', function (event) {
   if (!filterPopover.hidden && !filterMenu.contains(event.target)) setFilterMenuOpen(false);
+  if (searchControl && !searchControl.contains(event.target) && !digestSearch.value.trim()) setSearchOpen(false, false);
 });
 document.addEventListener('keydown', function (event) {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f' && digestSearch) {
     event.preventDefault();
     event.stopPropagation();
+    setSearchOpen(true, false);
     digestSearch.focus();
     digestSearch.select();
     return;
@@ -2670,12 +2921,13 @@ document.addEventListener('keydown', function (event) {
       return;
     }
   }
-  if (event.key === 'Escape' && digestSearch && digestSearch.value.trim()) {
+  if (event.key === 'Escape' && digestSearch && searchExpanded && !searchExpanded.hidden) {
     event.preventDefault();
     event.stopPropagation();
     digestSearch.value = '';
     syncSearchControl();
     filterCards();
+    setSearchOpen(false, false);
     return;
   }
   if (event.key === 'Escape' && !filterPopover.hidden) {
@@ -3261,11 +3513,10 @@ def _hide_truncated_formulas(text):
 def _load_full_abstracts(date_str):
     """Load full abstracts for a digest date from the sidecar file.
 
-    The digest markdown keeps 300-char abstract snippets (for the emailed
-    digest), while output.py writes the full abstracts to
-    digest_<date>.full.json so the desktop digest page can offer a
-    "Show more" / "Show less" toggle.  Older digests without a sidecar
-    degrade gracefully to the snippet stored in the digest file.
+    The digest markdown keeps compact abstract snippets, while output.py
+    writes the full abstracts to digest_<date>.full.json so the desktop page
+    and the 5-star email notification can use the complete text. Older
+    digests without a sidecar degrade gracefully to the stored snippet.
     """
     if not date_str:
         return {}
@@ -3319,7 +3570,7 @@ def _render_digest(digest=None):
             is_update_day=_is_arxiv_update_day(d.get("date", today_str))
         )
     prefs = load_preferences()
-    cfg, _ = _load_config_and_env()
+    cfg, env_vars = _load_config_and_env()
     apply_to_digest(d, d.get("date", today_str))
     score_counts = {
         star: sum(
@@ -3348,6 +3599,7 @@ def _render_digest(digest=None):
         full_abstracts=full_abstracts,
         star_display=_star_display,
         score_counts=score_counts,
+        email_configured=_email_is_configured(cfg, env_vars),
     )
 
 
@@ -3390,14 +3642,14 @@ def setup_submit():
     _apply_email(
         config, env_values,
         enable_email=request.form.get("enable_email") == "on",
-        email_sender=request.form.get("email_sender", "").strip(),
-        email_recipient=request.form.get("email_recipient", "").strip(),
+        email_address=request.form.get("email_address", "").strip(),
         smtp_server=request.form.get("smtp_server", "").strip(),
         smtp_protocol=request.form.get("smtp_protocol", "ssl"),
         smtp_port_value=request.form.get("smtp_port", "").strip(),
         email_password=request.form.get("email_password", "").strip(),
     )
     _write_env(env_values)
+    _refresh_email_environment(env_values)
     _write_config(config)
     os.environ[api_key_env] = api_key
     if _configured_profile_source(config) == "zotero":
@@ -3433,7 +3685,17 @@ def settings_save():
     prefs["include_cross"] = request.form.get("include_cross") == "on"
     prefs["include_replacements"] = request.form.get("include_replacements") == "on"
     prefs["auto_check_updates"] = request.form.get("auto_check_updates") == "on"
+    _apply_email(
+        config, env_values,
+        enable_email=request.form.get("enable_email") == "on",
+        email_address=request.form.get("email_address", "").strip(),
+        smtp_server=request.form.get("smtp_server", "").strip(),
+        smtp_protocol=request.form.get("smtp_protocol", "ssl"),
+        smtp_port_value=request.form.get("smtp_port", "").strip(),
+        email_password=request.form.get("email_password", "").strip(),
+    )
     _write_env(env_values)
+    _refresh_email_environment(env_values)
     _write_config(config)
     save_preferences(prefs)
     os.environ[api_key_env] = api_key
@@ -3454,6 +3716,75 @@ def settings_save():
         })
         return redirect(f"/settings?{query}#{settings_section}")
     return redirect(f"/settings?saved=1#{settings_section}")
+
+
+@app.route("/email/test", methods=["POST"])
+def email_test():
+    """Send a configuration test using the currently saved email settings."""
+    config, _ = _load_config_and_env()
+    email_config = config.get("email", {}) or {}
+    if not email_config.get("enabled", False):
+        return jsonify({"ok": False, "error": "Please enable and save email notification first."}), 400
+    ok = send_test_email(email_config)
+    return jsonify({
+        "ok": ok,
+        "message": "Test email sent." if ok else "Test email failed. Check the SMTP settings and App log.",
+    }), (200 if ok else 502)
+
+
+@app.route("/email/send-current", methods=["POST"])
+def email_send_current():
+    """Send the digest currently being viewed as an explicit manual resend."""
+    config, env_values = _load_config_and_env()
+    email_config = config.get("email", {}) or {}
+    if not _email_is_configured(config, env_values):
+        return jsonify({
+            "ok": False,
+            "error": "Please enable and save email notification first.",
+        }), 400
+
+    payload = request.get_json(silent=True) or request.form
+    requested = str(payload.get("date", "")).strip()
+    if requested:
+        try:
+            date.fromisoformat(requested)
+        except ValueError:
+            return jsonify({"ok": False, "error": "Date must use YYYY-MM-DD format."}), 400
+        digest_path = get_digest_path_for_date(requested)
+    else:
+        digest_path = get_latest_digest_path()
+    if not digest_path or not os.path.exists(digest_path):
+        return jsonify({"ok": False, "error": "No digest is available to send."}), 404
+
+    ok = send_digest_file(digest_path, email_config, force=True)
+    digest_date = requested or Path(digest_path).stem.replace("digest_", "")
+    return jsonify({
+        "ok": ok,
+        "message": "Digest email sent." if ok else "Digest email send failed. Check the SMTP settings and App log.",
+        "date": digest_date,
+    }), (200 if ok else 502)
+
+
+@app.route("/email/resend", methods=["POST"])
+def email_resend():
+    """Explicitly resend a stored digest email, bypassing daily deduplication."""
+    config, _ = _load_config_and_env()
+    email_config = config.get("email", {}) or {}
+    if not email_config.get("enabled", False):
+        return jsonify({"ok": False, "error": "Please enable and save email notification first."}), 400
+    payload = request.get_json(silent=True) or request.form
+    requested = str(payload.get("date", "")).strip()
+    digest_path = get_digest_path_for_date(requested) if requested else get_latest_digest_path()
+    if not digest_path or not os.path.exists(digest_path):
+        return jsonify({"ok": False, "error": "No digest is available to resend."}), 404
+    ok = send_digest_file(digest_path, email_config, force=True)
+    return jsonify({
+        "ok": ok,
+        "message": "Digest email resent." if ok else "Digest email resend failed.",
+        "date": requested or Path(digest_path).stem.replace("digest_", ""),
+    }), (200 if ok else 502)
+
+
 @app.route("/")
 def index():
     """Landing page: show last viewed or latest digest."""
@@ -3935,7 +4266,8 @@ def _run_desktop(server):
     """Open the native pywebview window and block until the user closes it."""
     global _desktop_window
     _write_run_info(server.server_port)
-    url = f"http://127.0.0.1:{server.server_port}"
+    initial_path = f"/digest/{_pending_open_date}" if _pending_open_date else "/"
+    url = f"http://127.0.0.1:{server.server_port}{initial_path}"
     window = webview.create_window(
         "AstroPaperDigest",
         url,
@@ -3955,7 +4287,7 @@ def _run_desktop(server):
 
 
 def main():
-    global _current_digest, _pipeline_message, _pipeline_status
+    global _current_digest, _pipeline_message, _pipeline_status, _pending_open_date
 
     parser = argparse.ArgumentParser(description="AstroPaperDigest desktop app")
     parser.add_argument(
@@ -3966,7 +4298,10 @@ def main():
     )
     parser.add_argument("--no-window", action="store_true", help="Serve only; don't open the desktop window")
     parser.add_argument("--no-run", action="store_true", help="Don't auto-start pipeline")
-    args = parser.parse_args()
+    # PyInstaller's macOS argv emulation appends a clicked custom URL to the
+    # command line. Keep normal CLI flags strict while accepting that one URL.
+    args, extra_args = parser.parse_known_args()
+    _pending_open_date = _deep_link_from_args(extra_args)
 
     signal.signal(signal.SIGTERM, _handle_termination_signal)
     signal.signal(signal.SIGINT, _handle_termination_signal)
@@ -3974,7 +4309,8 @@ def main():
     # Single instance: focus the existing window and exit instead of starting
     # a second server on a new random port.
     if not _acquire_single_instance_lock():
-        if _focus_existing_instance():
+        opened = _open_existing_instance(_pending_open_date)
+        if opened:
             print("AstroPaperDigest is already running; focusing its window.")
         else:
             print("AstroPaperDigest appears to be running, but its window could not be focused.")

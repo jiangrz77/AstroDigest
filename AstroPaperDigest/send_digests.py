@@ -5,11 +5,12 @@ Use this on a machine that can reach your SMTP server (e.g. inside the campus
 network) when the automated email step was skipped or failed.
 
 Usage:
-    python send_digests.py [YYYY-MM-DD ...]
+    python send_digests.py [--resend] [YYYY-MM-DD ...]
 
 Without arguments, the latest digest in output/digests is sent.  With dates,
-each matching digest_YYYY-MM-DD.md is sent.  Email settings come from
-config.yaml (email section) and the .env file (EMAIL_APP_PASSWORD).
+each matching digest_YYYY-MM-DD.md is sent. Email settings come from
+config.yaml (email section) and the .env file (EMAIL_APP_PASSWORD). Daily
+sends are deduplicated by date unless --resend is provided.
 """
 
 import os
@@ -24,7 +25,7 @@ sys.path.insert(0, str(_PROJECT_DIR))
 import yaml  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
-from src.notifier import send_digest_email  # noqa: E402
+from src.notifier import send_digest_file  # noqa: E402
 
 
 def main() -> int:
@@ -33,7 +34,8 @@ def main() -> int:
         config = yaml.safe_load(f)
     email_config = config.get("email", {})
 
-    dates = sys.argv[1:]
+    force = "--resend" in sys.argv[1:]
+    dates = [arg for arg in sys.argv[1:] if arg != "--resend"]
     if not dates:
         digest_dir = _PROJECT_DIR / "output" / "digests"
         files = sorted(digest_dir.glob("digest_*.md"))
@@ -49,8 +51,7 @@ def main() -> int:
             print(f"  {d}: digest file not found ({path.name})")
             ok = False
             continue
-        content = path.read_text(encoding="utf-8")
-        sent = send_digest_email(content, email_config, date_str=d)
+        sent = send_digest_file(path, email_config, force=force)
         print(f"  {d}: sent={sent}")
         ok = ok and sent
     return 0 if ok else 1

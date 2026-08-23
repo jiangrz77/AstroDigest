@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Backfill full abstracts for existing digest files.
 
-The digest markdown intentionally keeps 300-char abstract snippets (for the
-emailed digest).  The desktop digest page expands abstracts to their full text
-via sidecar files (output/digests/digest_<date>.full.json), which are only
-written when a digest is generated with the current output.py.  This script
+The digest markdown keeps compact abstract snippets. The desktop digest page
+and the 5-star email notification use sidecar files
+(output/digests/digest_<date>.full.json) for full abstracts, which are only
+written when a digest is generated with the current output.py. This script
 backfills those sidecar files for existing digests by fetching full abstracts
 from arXiv's export API.
 
