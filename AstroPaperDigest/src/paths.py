@@ -33,10 +33,25 @@ except Exception:
 _APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AstroPaperDigest"
 
 
+def app_support_dir() -> Path:
+    """Allow packaged smoke tests to use an isolated, explicit data directory.
+
+    Normal launches keep the existing location. Never change HOME to isolate
+    tests: Cocoa and other macOS services still need the real user home.
+    """
+    override = os.environ.get("APD_DATA_DIR")
+    if override:
+        data = Path(override)
+        if not data.is_absolute():
+            raise ValueError("APD_DATA_DIR must be an absolute path")
+        return data
+    return _APP_SUPPORT_DIR
+
+
 def data_dir() -> Path:
     """Return the writable data directory, creating it if needed."""
     if getattr(sys, "frozen", False):
-        data = _APP_SUPPORT_DIR
+        data = app_support_dir()
     else:
         data = Path(__file__).resolve().parent.parent
     data.mkdir(parents=True, exist_ok=True)

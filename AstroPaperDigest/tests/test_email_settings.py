@@ -22,6 +22,9 @@ from src import gui  # noqa: E402
 
 class EmailSettingsTests(unittest.TestCase):
     def setUp(self):
+        setup = mock.patch.object(gui, "_needs_setup", return_value=False)
+        setup.start()
+        self.addCleanup(setup.stop)
         app.config.update(TESTING=True)
         self.client = app.test_client()
 

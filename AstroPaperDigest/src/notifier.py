@@ -22,7 +22,7 @@ from .email_math import render_math_html
 
 APP_SCHEME = "astropaperdigest"
 EMAIL_STATE_PATH = _paths.data_dir() / "output" / "email" / "notification_state.json"
-RUN_INFO_PATH = Path.home() / "Library" / "Application Support" / "AstroPaperDigest" / "apd-run.json"
+RUN_INFO_PATH = _paths.app_support_dir() / "apd-run.json"
 
 
 def _env_or_config(env_name: str, email_config: dict, key: str, default=""):

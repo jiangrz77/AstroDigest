@@ -24,6 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r AstroPaperDigest/requirements.txt
           pip install pyinstaller
+          pip install pytest
+
+      - name: Run offline regression tests
+        working-directory: AstroPaperDigest
+        run: python -m pytest tests -q -k 'not full_pipeline_dry_run'
 
       - name: Build release artifacts (app + dmg + source/app zips + version.json)
         working-directory: AstroPaperDigest

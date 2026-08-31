@@ -95,7 +95,7 @@ _pending_open_date = ""
 
 # Single-instance + run-info location.  fcntl.flock releases automatically on
 # process exit, so a crashed app never leaves a "live" lock behind.
-_APD_APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "AstroPaperDigest"
+_APD_APP_SUPPORT_DIR = _paths.app_support_dir()
 _APD_LOCK_PATH = _APD_APP_SUPPORT_DIR / "apd.lock"
 _APD_RUN_INFO_PATH = _APD_APP_SUPPORT_DIR / "apd-run.json"
 

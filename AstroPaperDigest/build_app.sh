@@ -54,6 +54,7 @@ echo "Building embedded CLI..."
 "$PYTHON_BIN" -m PyInstaller \
     --noconfirm --clean --console \
     --name apd-cli \
+    --collect-data latex2mathml \
     --paths "$APP_ROOT" \
     --distpath "$CLI_DIST" \
     --workpath "$CLI_WORK" \
@@ -68,6 +69,7 @@ echo "Building native GUI bundle..."
     --icon "$APP_ROOT/assets/AppIcon.icns" \
     --paths "$APP_ROOT" \
     --collect-all webview \
+    --collect-data latex2mathml \
     --add-data "$APP_ROOT/static:static" \
     --add-binary "$CLI_DIST/apd-cli:." \
     --distpath "$APP_DIST" \
@@ -94,6 +96,7 @@ PLIST="$APP_DIST/$APP_NAME.app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string astropaperdigest" "$PLIST" 2>/dev/null || true
 
 codesign --force --deep -s - "$APP_DIST/$APP_NAME.app"
+"$PYTHON_BIN" "$APP_ROOT/verify_bundle.py" "$APP_DIST/$APP_NAME.app"
 cp -R "$APP_DIST/$APP_NAME.app" "$APP_DIR"
 
 echo ""

@@ -11,6 +11,13 @@ from src import gui
 
 
 class DisplayCategoryTests(unittest.TestCase):
+    def setUp(self):
+        # These are configured-user route tests, independent of a developer's
+        # untracked .env file (a clean release checkout has none).
+        setup = patch.object(gui, "_needs_setup", return_value=False)
+        setup.start()
+        self.addCleanup(setup.stop)
+
     def test_empty_selection_is_preserved(self):
         self.assertEqual(
             gui._normalize_display_categories([]),

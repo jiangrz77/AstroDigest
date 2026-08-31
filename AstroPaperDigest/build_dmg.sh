@@ -29,6 +29,7 @@ mkdir -p build dist
 "$PYTHON" -m PyInstaller --noconfirm --clean --console \
   --name apd-cli \
   --paths "$APP_ROOT" \
+  --collect-data latex2mathml \
   --distpath "$APP_ROOT/build/cli" --workpath "$APP_ROOT/build/pyi-cli" --specpath "$APP_ROOT/build" \
   "$APP_ROOT/cli_entry.py" > "$APP_ROOT/build/cli-build.log" 2>&1
 
@@ -40,6 +41,7 @@ echo "==> Building self-contained .app ..."
   --icon "$APP_ROOT/assets/AppIcon.icns" \
   --paths "$APP_ROOT" \
   --collect-all webview \
+  --collect-data latex2mathml \
   --add-data "$APP_ROOT/static:static" \
   --add-binary "$APP_ROOT/build/cli/apd-cli:." \
   --distpath "$APP_ROOT/dist" --workpath "$APP_ROOT/build/pyi-app" --specpath "$APP_ROOT/build" \
@@ -61,6 +63,9 @@ PLIST="$APP_ROOT/dist/$APP_NAME.app/Contents/Info.plist"
 
 echo "==> Ad-hoc signing the .app (no Developer ID required) ..."
 codesign --force --deep -s - "$APP_ROOT/dist/$APP_NAME.app"
+
+echo "==> Verifying packaged startup (isolated from user data) ..."
+"$PYTHON" "$APP_ROOT/verify_bundle.py" "$APP_ROOT/dist/$APP_NAME.app"
 
 echo "==> Creating dmg ..."
 rm -rf "$APP_ROOT/build/dmgroot"
