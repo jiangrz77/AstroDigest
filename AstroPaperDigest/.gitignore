@@ -21,3 +21,6 @@ preferences.json
 # Personal data (contains local paths)
 data/AllCollection.bib
 data/ArxivDailyCollection.bib
+
+# Local developer/AI docs (intentionally maintained outside version control)
+docs/ai/

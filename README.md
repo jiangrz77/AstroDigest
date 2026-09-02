@@ -4,10 +4,13 @@
 
 Automatically fetches, filters, and ranks daily astrophysics papers based on your research interests using LLM-powered relevance scoring. Comes with a native desktop window for browsing, date navigation, and personalized settings.
 
+![AstroPaperDigest desktop app — daily digest with recommendation reasons, paper figures, and collapsible abstracts](docs/screenshot-digest.png)
+
 ## Features
 
-- **LLM ranking**: DeepSeek (or any OpenAI-compatible API) scores paper relevance 1-10
+- **LLM ranking**: DeepSeek (or any OpenAI-compatible API) scores paper relevance 1-5 stars with a short recommendation reason
 - **Desktop UI**: Native macOS window (WebKit) with date navigation, tiered browsing, and real-time filtering
+- **Recommendation cards**: each 4-5 star paper shows its recommendation reason and first figure (fetched from arXiv HTML, with PDF fallback); abstracts stay one click away
 - **Setup wizard**: First-launch wizard for API key and research interests
 - **Zotero library**: Read a local Zotero database directly to build the research profile
 - **Dual output**: BibTeX entries + Markdown digest, organized by date

@@ -7,8 +7,10 @@ window -> pipeline runs in the background -> page auto-updates when done.
 
 import argparse
 import fcntl
+import html
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -18,13 +20,13 @@ import sys
 import tempfile
 import time
 from collections import deque
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, Timer
 from urllib.parse import urlencode, urlparse
 
-from flask import Flask, abort, jsonify, redirect, render_template_string, request
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file
 from dotenv import dotenv_values, load_dotenv
 from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
@@ -42,6 +44,14 @@ sys.path.insert(0, str(_PROJECT_DIR))
 load_dotenv(_PROJECT_DIR / ".env", interpolate=False)
 
 from src.digest_parser import parse_digest, get_latest_digest_path, get_digest_path_for_date, get_available_dates
+from src.figures import (
+    CAPTION_VERSION,
+    MAX_FIGURES,
+    MIN_SCORE as FIGURE_MIN_SCORE,
+    fetch_figures_for_digest,
+    figure_path,
+    load_sidecar as load_figure_sidecar,
+)
 from src.notifier import load_email_state, send_digest_file, send_test_email
 from src import updater
 from src.preference_learning import (
@@ -892,6 +902,7 @@ def _commit_staged_outputs(staging_dir: str) -> dict[str, list[str]]:
     destinations = {
         "digests": Path(output_cfg.get("digest_dir", "./output/digests")),
         "bibtex": Path(output_cfg.get("bibtex_dir", "./output/bibtex")),
+        "figures": Path(output_cfg.get("figures_dir", "./output/figures")),
     }
     published = {kind: [] for kind in destinations}
     root = Path(staging_dir)
@@ -2400,37 +2411,63 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .scope-banner-actions{display:flex;align-items:center;gap:10px;white-space:nowrap;margin-left:auto;color:#476581}
 .scope-banner-close{border:none;background:transparent;color:#476581;font-size:18px;line-height:1;padding:0 2px;cursor:pointer}
 .scope-banner-close:hover{color:#0f3d69}
-.container{max-width:900px;margin:0 auto;padding:24px 16px}
+.container{max-width:1080px;margin:0 auto;padding:24px 16px}
 .tier-header{margin:28px 0 12px;padding-bottom:8px;border-bottom:2px solid #e0e0e0;scroll-margin-top:165px}
 .tier-header h2{font-size:18px}
 .tier-strongly{color:#d97706;border-color:#d97706}
 .tier-highly{color:#27ae60;border-color:#27ae60}
 .tier-possibly{color:#2563eb;border-color:#2563eb}
 .tier-marginal{color:#95a5a6;border-color:#95a5a6}
-.card{background:#fff;border-radius:10px;padding:18px 20px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.08);transition:box-shadow .2s}
+.card{background:#fff;border-radius:10px;padding:24px 20px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);transition:box-shadow .2s;overflow:hidden}
 .card:hover{box-shadow:0 3px 12px rgba(0,0,0,.12)}
 .search-empty{padding:56px 20px;color:#94a3b8;font-size:14px;text-align:center}
-.card-title{font-size:15px;font-weight:600;color:#2c3e50;margin-bottom:6px;display:flex;align-items:flex-start;gap:10px}
-.score-badge{display:inline-block;min-width:82px;text-align:center;padding:3px 8px;border-radius:12px;background:#fff;font-size:15px;font-weight:700;letter-spacing:1px;line-height:1;color:#cbd5e1;flex-shrink:0}
+.card-title{font-size:19px;font-weight:600;color:#2c3e50;margin-bottom:10px;display:flex;align-items:center;gap:10px;letter-spacing:.3px;border-bottom:1px solid #e0e0e0;padding-bottom:10px}
+.score-badge{display:inline-block;min-width:88px;text-align:center;padding:3px 8px;border-radius:12px;background:#fff;font-size:16px;font-weight:700;letter-spacing:1px;line-height:1;color:#cbd5e1;flex-shrink:0}
 .score-strong{color:#f4b400}.score-high{color:#27ae60}.score-three{color:#2563eb}.score-two{color:#8b5cf6}.score-low{color:#95a5a6}.score-failed{background:#dc2626;color:#fff;font-size:12px;letter-spacing:0}
 .stars-empty{color:#d7dde5}
 .adj-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;flex-shrink:0}
 .adj-pos{background:#e8f5e9;color:#2e7d32}
 .adj-neg{background:#fdecea;color:#c62828}
-.card-reason{font-size:13px;color:#666;margin-bottom:4px}
-.card-meta{font-size:12px;color:#999;margin-bottom:8px}
-.card-abstract{font-size:13px;color:#555;line-height:1.5;margin-bottom:10px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.card-abstract.expanded{display:block;-webkit-line-clamp:unset}
-.abstract-toggle{display:none;margin:-4px 0 10px;padding:0;border:none;background:none;font:inherit;font-size:12px;color:#7a8699;cursor:pointer;line-height:1.4;user-select:none}
-.abstract-toggle:hover{color:#4a5568}
-.card-actions{display:flex;gap:8px;align-items:center}
+.card-reason{display:flex;gap:8px;align-items:baseline;font-size:16px;line-height:1.45;letter-spacing:.25px;color:#3f4a5a;border-left:3px solid;border-radius:4px;padding:7px 10px;margin:4px 0 14px}
+.reason-label{flex-shrink:0;font-size:13px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.reason-text b{font-weight:600}
+.reason-strong{background:#fdf6e7;border-left-color:#e8a33d}
+.reason-strong .reason-label,.reason-strong .reason-text b{color:#b45309}
+.reason-high{background:#eefaf2;border-left-color:#27ae60}
+.reason-high .reason-label,.reason-high .reason-text b{color:#1e7e34}
+.reason-text b{font-weight:600;color:#8a4b08}
+.card-figure{position:relative;float:right;display:block;width:180px;height:135px;margin:2px 0 0 16px;border:1px solid #e3e8ef;border-radius:8px;overflow:hidden;background:#f8fafc;cursor:zoom-in}
+.card-figure img{display:block;width:100%;height:100%;object-fit:contain}
+.figure-badge{position:absolute;right:6px;bottom:6px;background:rgba(15,23,42,.72);color:#fff;font-size:11px;font-weight:600;padding:2px 7px;border-radius:10px}
+.card-figure-loading{height:135px;background:linear-gradient(100deg,#f1f5f9 40%,#e2e8f0 50%,#f1f5f9 60%);background-size:200% 100%;animation:figure-shimmer 1.4s linear infinite}
+@keyframes figure-shimmer{to{background-position:-200% 0}}
+.lightbox{position:fixed;inset:0;z-index:300;background:rgba(15,23,42,.86);display:flex;align-items:center;justify-content:center}
+.lightbox[hidden]{display:none}
+.lightbox-stage{display:flex;flex-direction:column;align-items:center;max-width:94vw}
+.lightbox img{max-width:92vw;max-height:80vh;border-radius:8px;background:#fff;box-shadow:0 12px 48px rgba(0,0,0,.5)}
+.lightbox-caption{max-width:min(760px,88vw);margin-top:12px;color:#d6dee8;font-size:13px;line-height:1.55;text-align:center;max-height:10vh;overflow:auto;white-space:pre-wrap}
+.lightbox-close{position:absolute;top:14px;right:18px;width:38px;height:38px;border:none;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:18px;line-height:1;cursor:pointer}
+.lightbox-close:hover{background:rgba(255,255,255,.24)}
+.lightbox-nav{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:64px;border:none;border-radius:8px;background:rgba(255,255,255,.12);color:#fff;font-size:30px;line-height:1;cursor:pointer}
+.lightbox-nav:hover{background:rgba(255,255,255,.24)}
+.lightbox-prev{left:18px}.lightbox-next{right:18px}
+.lightbox-dots{position:absolute;bottom:22px;display:flex;gap:8px}
+.lightbox-dot{width:9px;height:9px;padding:0;border:none;border-radius:50%;background:rgba(255,255,255,.35);cursor:pointer}
+.lightbox-dot.active{background:#fff}
+.card-meta{font-size:12px;color:#999;margin-bottom:14px}
+.card-abstract{position:relative;font-size:13px;color:#555;line-height:1.5;margin-bottom:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.abstract-label{display:inline-block;font-size:13px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#64748b;margin-right:8px}
+.card-abstract.expanded,.card-abstract.search-auto-expanded{display:block;-webkit-line-clamp:unset}
+.card-abstract::after{content:'▾';position:absolute;right:0;bottom:0;padding:0 2px 0 14px;background:linear-gradient(to right,rgba(255,255,255,0),#fff 45%);color:#7a8699;font-size:12px;line-height:19.5px;cursor:pointer}
+.card-abstract.expanded::after,.card-abstract.search-auto-expanded::after,.card-abstract.fits::after{content:none}
+.card-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .card-actions a{font-size:12px;color:#3498db;text-decoration:none}
 .card-actions a:hover{text-decoration:underline}
-.fb-btn{padding:4px 12px;border:1px solid #ddd;border-radius:14px;font-size:12px;cursor:pointer;background:#fff;transition:all .2s}
+.fb-btn{padding:4px 12px;border:1px solid #c2cad4;border-radius:14px;font-size:12px;cursor:pointer;background:#fff;transition:all .2s}
 .fb-btn:hover{border-color:#999}
 .fb-minus{color:#95a5a6}.fb-minus:hover{background:#f1f5f9;border-color:#cbd5e1}
 .fb-plus{color:#f4b400}.fb-plus:hover{background:#fff8db;border-color:#f4b400}
-.fb-btn:disabled{opacity:.38;cursor:default;background:#fff;border-color:#ddd}
+.fb-btn:disabled{opacity:.24;cursor:default;background:#fff;border-color:#ddd}
 .btn-order-refresh{position:fixed;right:24px;bottom:24px;z-index:120;width:48px;height:48px;padding:0;border:1px solid #93c5fd;border-radius:50%;background:#fff;color:#2563eb;font-size:24px;font-weight:600;line-height:1;cursor:pointer;box-shadow:0 4px 14px rgba(37,99,235,.22);transition:background .16s ease,transform .16s ease,box-shadow .16s ease}
 .btn-order-refresh:hover{background:#eff6ff;transform:translateY(-2px);box-shadow:0 7px 18px rgba(37,99,235,.28)}
 .btn-order-refresh:focus-visible{outline:3px solid rgba(37,99,235,.3);outline-offset:2px}
@@ -2590,12 +2627,24 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       {% endif %}
       <span>{{ paper.title }}</span>
     </div>
-    {% if paper.reason %}<div class="card-reason">{{ paper.reason }}</div>{% endif %}
+    {% if paper.score and not paper.scoring_failed and paper.score|int >= 4 %}
+      {% set fig = figure_map.get(paper.paper_id) %}
+      {% if fig and fig.files %}
+      <a class="card-figure" role="button" tabindex="0" data-figure-pid="{{ paper.paper_id }}" data-figure-count="{{ fig.files | length }}" data-captions='{{ fig.captions | tojson }}' title="View figures">
+        <img src="/figure/{{ paper.paper_id }}" alt="First figure" loading="lazy">
+        {% if fig.files | length > 1 %}<span class="figure-badge">+{{ fig.files | length - 1 }}</span>{% endif %}
+      </a>
+      {% elif paper.paper_id in figure_pending %}
+      <div class="card-figure card-figure-loading" data-figure-pid="{{ paper.paper_id }}" title="Fetching figure…"></div>
+      {% endif %}
+    {% endif %}
+    {% if paper.reason and not paper.scoring_failed and paper.score|int >= 4 %}{% set reason_kind = 'strong' if paper.score|int == 5 else 'high' %}<div class="card-reason reason-{{ reason_kind }}"><span class="reason-label">Match</span><span class="reason-text">{{ reason_html.get(paper.paper_id, '') | safe }}</span></div>{% endif %}
     <div class="card-meta">{{ paper.authors[:80] }}{% if paper.categories %} &nbsp;|&nbsp; {{ paper.categories }}{% endif %}</div>
-    {% if paper.abstract %}<div class="card-abstract" id="abs-{{ paper.paper_id | replace('.', '-') }}">{{ full_abstracts.get(paper.paper_id, paper.abstract) }}</div>
-    <button class="abstract-toggle" type="button" data-target="abs-{{ paper.paper_id | replace('.', '-') }}">Show more &#9660;</button>{% endif %}
+    {% if paper.abstract %}<div class="card-abstract"><span class="abstract-label">Abstract</span>{{ full_abstracts.get(paper.paper_id, paper.abstract) }}</div>{% endif %}
     <div class="card-actions">
-      {% if paper.link %}<a href="{{ paper.link }}" target="_blank">arxiv:{{ paper.paper_id }}</a>{% endif %}
+      {% if paper.link %}<a href="{{ paper.link }}" target="_blank" rel="noopener">abs</a>
+      <a href="https://arxiv.org/pdf/{{ paper.paper_id }}" target="_blank" rel="noopener">pdf</a>
+      <a href="https://arxiv.org/html/{{ paper.paper_id }}" target="_blank" rel="noopener">html</a>{% endif %}
       {% if not paper.scoring_failed %}<button class="fb-btn fb-plus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'underrated')" title="Increase by one star" aria-label="Increase rating by one star" {% if paper.score >= 5 %}disabled{% endif %}>+ ★</button>
       <button class="fb-btn fb-minus" data-id="{{ paper.paper_id }}" data-title="{{ paper.title[:80] }}" onclick="giveFeedback(this,'overrated')" title="Reduce by one star" aria-label="Reduce rating by one star" {% if paper.score <= 1 %}disabled{% endif %}>− ☆</button>{% endif %}
     </div>
@@ -2751,8 +2800,6 @@ function clearSearchHighlights() {
   });
   document.querySelectorAll('.card-abstract.search-auto-expanded').forEach(function (abstract) {
     abstract.classList.remove('expanded', 'search-auto-expanded');
-    const toggle = document.querySelector('.abstract-toggle[data-target="' + abstract.id + '"]');
-    if (toggle) toggle.innerHTML = 'Show more &#9660;';
   });
 }
 function escapeSearchTokenSafe(token) {
@@ -2801,8 +2848,6 @@ function expandAbstractForSearch(card, tokens) {
   const source = (abstract.textContent || '').toLocaleLowerCase();
   if (!tokens.some(function (token) { return source.indexOf(token) >= 0; })) return;
   abstract.classList.add('expanded', 'search-auto-expanded');
-  const toggle = card.querySelector('.abstract-toggle');
-  if (toggle) toggle.innerHTML = 'Show less &#9650;';
 }
 function refreshSearchMatches() {
   clearSearchHighlights();
@@ -2842,8 +2887,6 @@ function goToSearchMatch(direction) {
     const previousAbstract = current.querySelector('.card-abstract.search-auto-expanded');
     if (previousAbstract) {
       previousAbstract.classList.remove('expanded', 'search-auto-expanded');
-      const previousToggle = current.querySelector('.abstract-toggle');
-      if (previousToggle) previousToggle.innerHTML = 'Show more &#9660;';
     }
   }
   searchMatchCards.forEach(function (card) { card.classList.remove('search-current'); });
@@ -2851,9 +2894,11 @@ function goToSearchMatch(direction) {
   card.classList.add('search-current');
   expandAbstractForSearch(card, searchTokens());
   const sticky = document.querySelector('.sticky-wrapper');
-  const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
-  const top = card.getBoundingClientRect().top + window.scrollY - offset;
-  window.scrollTo({top: Math.max(0, top), behavior:'smooth'});
+  smoothScrollTo(function () {
+    if (!document.body.contains(card)) return null;
+    const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
+    return card.getBoundingClientRect().top + window.scrollY - offset;
+  });
 }
 function syncSearchControl() {
   const hasSearch = Boolean(digestSearch && digestSearch.value.trim());
@@ -2968,13 +3013,44 @@ document.addEventListener('keydown', function (event) {
 });
 applyCategoryDisplay();
 updateAllCategoryButton();
+// Smooth scroll whose target keeps up with late layout shifts (figures
+// loading, abstract clamps settling).  Corrects the position twice after
+// the initial scroll; any manual user input cancels the corrections.
+function smoothScrollTo(getTop) {
+  const timers = [];
+  const cancel = function () { timers.forEach(clearTimeout); };
+  ['wheel', 'touchstart', 'keydown'].forEach(function (name) {
+    window.addEventListener(name, cancel, {once: true, passive: true});
+  });
+  const go = function (smooth) {
+    const top = getTop();
+    if (top === null || top === undefined || !isFinite(top)) return;
+    window.scrollTo({top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto'});
+  };
+  go(true);
+  timers.push(setTimeout(function () { go(false); }, 450));
+  timers.push(setTimeout(function () { go(false); }, 1000));
+}
 function scrollToScore(score) {
-  const header = document.querySelector('.tier-header[data-tier="' + tierKey(score) + '"]');
-  if (!header || header.style.display === 'none') return;
+  const key = tierKey(score);
+  let target = document.querySelector('.tier-header[data-tier="' + key + '"]');
+  // Scores sharing a tier (2-3 stars share "medium") open at the tier head,
+  // which starts with the higher score; jump to the first card of the exact
+  // score instead so e.g. ★★ lands on the 2-star papers.
+  const tierTopScore = {strong: 5, high: 4, medium: 3, low: 1}[key];
+  if (score !== tierTopScore) {
+    const card = Array.from(document.querySelectorAll('.card[data-score="' + score + '"]'))
+      .find(function (c) { return c.style.display !== 'none'; });
+    if (card) target = card;
+  }
+  if (!target || target.style.display === 'none') return;
+  const finalTarget = target;
   const sticky = document.querySelector('.sticky-wrapper');
-  const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
-  const top = header.getBoundingClientRect().top + window.scrollY - offset;
-  window.scrollTo({top: Math.max(0, top), behavior:'smooth'});
+  smoothScrollTo(function () {
+    if (!document.body.contains(finalTarget)) return null;
+    const offset = sticky ? sticky.getBoundingClientRect().height + 12 : 12;
+    return finalTarget.getBoundingClientRect().top + window.scrollY - offset;
+  });
 }
 function tierKey(score) {
   return score === 5 ? 'strong' : (score === 4 ? 'high' : (score >= 2 ? 'medium' : 'low'));
@@ -3223,35 +3299,225 @@ function refreshVisibleCounts() {
 // Apply initial filter on page load
 filterCards();
 
-// Show more / show less for card abstracts.  Truncation rule: only
-// abstracts clearly longer than 3 lines (more than half a line beyond the
-// 3-line clamp, i.e. over ~3.5 lines) are clipped to 3 lines and get a
-// toggle; shorter ones are shown in full, so a couple of dangling words are
-// never hidden behind a button.
-function setupAbstractToggles() {
-  document.querySelectorAll('.card-abstract').forEach(function (el) {
-    const overflow = el.scrollHeight - el.clientHeight;
-    const halfLine = parseFloat(getComputedStyle(el).lineHeight) / 2;
-    if (overflow > halfLine) {
-      const btn = document.querySelector('.abstract-toggle[data-target="' + el.id + '"]');
-      if (btn) btn.style.display = 'inline-block';
-    } else {
-      el.classList.add('expanded');
+// Abstract: collapsed to a few lines by CSS; clicking anywhere on the
+// abstract expands/collapses it.  Text selection is preserved: a click that
+// finishes a selection (drag, double/triple click) never toggles.
+function setupAbstractCaret(el) {
+  const overflow = el.scrollHeight - el.clientHeight;
+  const halfLine = parseFloat(getComputedStyle(el).lineHeight) / 2;
+  el.classList.toggle('fits', overflow <= halfLine);
+}
+function abstractClicked(event) {
+  if (event.detail > 1) return;
+  const selection = window.getSelection();
+  if (selection && String(selection).length) return;
+  this.classList.remove('search-auto-expanded');
+  this.classList.toggle('expanded');
+}
+// The figure spans the card's right side from below the title down to the
+// bottom of the abs/pdf row (which flows beside it), keeping a 4:3 box:
+// its height follows the text stack (reason + authors + a fixed 3-line
+// abstract + the links row) so the card's two columns end together.
+function layoutFigures() {
+  document.querySelectorAll('.card').forEach(function (card) {
+    const figure = card.querySelector('.card-figure');
+    if (!figure) return;
+    const abstract = card.querySelector('.card-abstract');
+    const title = card.querySelector('.card-title');
+    if (!title) return;
+    if (abstract && !abstract.classList.contains('expanded') &&
+        !abstract.classList.contains('search-auto-expanded')) {
+      abstract.style.setProperty('-webkit-line-clamp', '3');
+      setupAbstractCaret(abstract);
     }
+    const lineHeight = abstract ? (parseFloat(getComputedStyle(abstract).lineHeight) || 19.5) : 19.5;
+    const titleBottom = title.getBoundingClientRect().bottom;
+    let contentBottom = titleBottom;
+    card.querySelectorAll('.card-reason, .card-meta, .card-abstract, .card-actions').forEach(function (el) {
+      const rect = el.getBoundingClientRect();
+      const height = (el === abstract)
+        ? Math.min(rect.height, lineHeight * 3 + 10)  // expanded text still sizes for 3 lines
+        : rect.height;
+      contentBottom = Math.max(contentBottom, rect.top + height);
+    });
+    let height = Math.max(135, contentBottom - titleBottom - 2);
+    if (height > 300) height = 300;  // keeps the 4:3 width within 400px
+    figure.style.height = height + 'px';
+    figure.style.width = Math.round(height * 4 / 3) + 'px';
   });
 }
-function toggleAbstract(btn) {
-  const el = document.getElementById(btn.dataset.target);
-  if (!el) return;
-  el.classList.remove('search-auto-expanded');
-  const expanded = el.classList.toggle('expanded');
-  btn.innerHTML = expanded ? 'Show less &#9650;' : 'Show more &#9660;';
-}
-document.querySelectorAll('.abstract-toggle').forEach(function (b) {
-  b.addEventListener('click', function () { toggleAbstract(this); });
+document.querySelectorAll('.card-abstract').forEach(function (el) {
+  el.addEventListener('click', abstractClicked);
+  setupAbstractCaret(el);
 });
-setupAbstractToggles();
+document.querySelectorAll('.card-figure img').forEach(function (img) {
+  img.addEventListener('load', layoutFigures);
+});
+let clampResizeTimer = null;
+window.addEventListener('resize', function () {
+  if (clampResizeTimer) clearTimeout(clampResizeTimer);
+  clampResizeTimer = setTimeout(layoutFigures, 200);
+});
+window.addEventListener('load', layoutFigures);
+setTimeout(layoutFigures, 400);
 </script>
+<script>
+// Figure gallery lightbox: click a card thumbnail to browse that paper's
+// figures at full size (arrows / arrow keys switch, ESC or backdrop closes).
+(function () {
+  const lightbox = document.createElement('div');
+  lightbox.className = 'lightbox';
+  lightbox.hidden = true;
+  lightbox.innerHTML =
+    '<button class="lightbox-close" type="button" aria-label="Close">✕</button>' +
+    '<button class="lightbox-nav lightbox-prev" type="button" aria-label="Previous figure">‹</button>' +
+    '<div class="lightbox-stage"><img alt="Figure"><div class="lightbox-caption"></div></div>' +
+    '<button class="lightbox-nav lightbox-next" type="button" aria-label="Next figure">›</button>' +
+    '<div class="lightbox-dots"></div>';
+  document.body.appendChild(lightbox);
+  const image = lightbox.querySelector('img');
+  const captionEl = lightbox.querySelector('.lightbox-caption');
+  const dots = lightbox.querySelector('.lightbox-dots');
+  const prevBtn = lightbox.querySelector('.lightbox-prev');
+  const nextBtn = lightbox.querySelector('.lightbox-next');
+  let pid = '', count = 1, index = 1, captions = [];
+  function render() {
+    image.src = '/figure/' + encodeURIComponent(pid) + '/' + index;
+    const caption = (captions[index - 1] || '').trim();
+    captionEl.textContent = caption;
+    captionEl.style.display = caption ? '' : 'none';
+    const multi = count > 1;
+    prevBtn.hidden = !multi;
+    nextBtn.hidden = !multi;
+    dots.innerHTML = '';
+    for (let i = 1; i <= count; i++) {
+      const dot = document.createElement('button');
+      dot.type = 'button';
+      dot.className = 'lightbox-dot' + (i === index ? ' active' : '');
+      dot.addEventListener('click', function () { index = i; render(); });
+      dots.appendChild(dot);
+    }
+  }
+  function open(targetPid, targetCount, captionsJson) {
+    pid = targetPid;
+    count = Math.max(1, targetCount);
+    index = 1;
+    try {
+      captions = JSON.parse(captionsJson || '[]') || [];
+    } catch (e) {
+      captions = [];
+    }
+    render();
+    lightbox.hidden = false;
+    document.body.style.overflow = 'hidden';
+  }
+  function close() {
+    lightbox.hidden = true;
+    document.body.style.overflow = '';
+    image.src = '';
+  }
+  function step(delta) {
+    index = ((index - 1 + delta) + count) % count + 1;
+    render();
+  }
+  lightbox.querySelector('.lightbox-close').addEventListener('click', close);
+  prevBtn.addEventListener('click', function () { step(-1); });
+  nextBtn.addEventListener('click', function () { step(1); });
+  lightbox.addEventListener('click', function (event) {
+    if (event.target === lightbox) close();
+  });
+  document.addEventListener('keydown', function (event) {
+    if (lightbox.hidden) return;
+    if (event.key === 'Escape') close();
+    else if (event.key === 'ArrowLeft') step(-1);
+    else if (event.key === 'ArrowRight') step(1);
+  });
+  // Delegated click covers thumbnails present at load and the ones the
+  // backfill poller swaps in later.
+  document.addEventListener('click', function (event) {
+    if (!event.target.closest) return;
+    const anchor = event.target.closest('.card-figure[data-figure-count]');
+    if (!anchor) return;
+    event.preventDefault();
+    open(anchor.dataset.figurePid || '', Number(anchor.dataset.figureCount) || 1,
+         anchor.dataset.captions || '[]');
+  });
+})();
+</script>
+{% if figure_pending or figure_backfill_active %}
+<script>
+// Figures for this digest are being fetched or upgraded in the background
+// (new placeholders, or gallery upgrades for papers recorded at a lower
+// depth).  Poll until the run ends, swapping in thumbnails and refreshing
+// "+N" badges as figures land.
+(function () {
+  const digestDate = {{ digest.date | tojson }};
+  let remaining = 45;  // ~3 minutes at 4s intervals
+  function fillHolder(pid, entry) {
+    const files = (entry && entry.files) || [];
+    const count = files.length || 1;
+    // Upgrade pass: the thumbnail already exists, refresh its gallery count.
+    const known = document.querySelector('.card-figure[data-figure-pid="' + pid + '"]:not(.card-figure-loading)');
+    if (known) {
+      known.dataset.figureCount = String(count);
+      known.dataset.captions = JSON.stringify((entry && entry.captions) || []);
+      let badge = known.querySelector('.figure-badge');
+      if (count > 1) {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'figure-badge';
+          known.appendChild(badge);
+        }
+        badge.textContent = '+' + (count - 1);
+      } else if (badge) {
+        badge.remove();
+      }
+      return;
+    }
+    const holder = document.querySelector('.card-figure-loading[data-figure-pid="' + pid + '"]');
+    if (!holder) return;
+    const anchor = document.createElement('a');
+    anchor.className = 'card-figure';
+    anchor.setAttribute('role', 'button');
+    anchor.title = 'View figures';
+    anchor.dataset.figurePid = pid;
+    anchor.dataset.figureCount = String(count);
+    anchor.dataset.captions = JSON.stringify((entry && entry.captions) || []);
+    const img = document.createElement('img');
+    img.src = '/figure/' + encodeURIComponent(pid);
+    img.alt = 'First figure';
+    img.addEventListener('load', layoutFigures);
+    anchor.appendChild(img);
+    if (count > 1) {
+      const badge = document.createElement('span');
+      badge.className = 'figure-badge';
+      badge.textContent = '+' + (count - 1);
+      anchor.appendChild(badge);
+    }
+    holder.replaceWith(anchor);
+  }
+  function finish() {
+    document.querySelectorAll('.card-figure-loading').forEach(function (holder) { holder.remove(); });
+  }
+  function poll() {
+    fetch('/digest/' + digestDate + '/figures-status')
+      .then(function (response) { return response.json(); })
+      .then(function (status) {
+        Object.keys(status.figures || {}).forEach(function (pid) {
+          fillHolder(pid, status.figures[pid]);
+        });
+        if (!status.running || --remaining <= 0) { finish(); return; }
+        setTimeout(poll, 4000);
+      })
+      .catch(function () {
+        if (--remaining <= 0) { finish(); return; }
+        setTimeout(poll, 4000);
+      });
+  }
+  poll();
+})();
+</script>
+{% endif %}
 <script>
 window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
 </script>
@@ -3562,6 +3828,188 @@ def _load_full_abstracts(date_str):
         return {}
 
 
+# --- Paper figures ---------------------------------------------------------
+# 4-5 star cards show the paper's first figure beside the recommendation
+# reason.  The pipeline fetches figures for new digests (src/figures.py);
+# digests created before that feature are backfilled here on first view.
+
+# Beyond this age a digest's papers mostly predate arXiv's HTML rendering,
+# so backfilling would hammer the PDF fallback for little value.
+_FIGURE_BACKFILL_WINDOW_DAYS = 60
+_figure_backfill_lock = Lock()
+_figure_backfill_state = {"running": False, "date": "", "done": set()}
+
+
+def _digests_dir() -> str:
+    return os.path.join(str(_PROJECT_DIR), "output", "digests")
+
+
+def _figures_dir() -> str:
+    return os.path.join(str(_PROJECT_DIR), "output", "figures")
+
+
+def _figure_candidates(digest: dict) -> list[str]:
+    """Paper ids of the digest's 4-5 star, successfully scored papers."""
+    ids = []
+    for tier in digest.get("tiers", []):
+        for paper in tier.get("papers", []):
+            if paper.get("scoring_failed") or not paper.get("paper_id"):
+                continue
+            try:
+                score = int(paper.get("score") or 0)
+            except (TypeError, ValueError):
+                continue
+            if score >= FIGURE_MIN_SCORE:
+                ids.append(paper["paper_id"])
+    return ids
+
+
+def _figure_backfill_needed(candidates: list[str], sidecar: dict) -> bool:
+    """True when any candidate lacks an entry, was fetched at a lower
+    gallery depth than the current MAX_FIGURES, or predates captions."""
+    for pid in candidates:
+        if pid in sidecar["failed"]:
+            continue
+        entry = sidecar["papers"].get(pid)
+        if entry is None:
+            return True
+        try:
+            depth = int(entry.get("depth") or 1)
+        except (TypeError, ValueError):
+            depth = 1
+        if depth < MAX_FIGURES:
+            return True
+        if (entry.get("capv") or 0) < CAPTION_VERSION:
+            return True
+    return False
+
+
+def _start_figure_backfill(date_str: str) -> None:
+    """Fetch missing figures for an old digest in a background thread."""
+    with _figure_backfill_lock:
+        if _figure_backfill_state["running"] or date_str in _figure_backfill_state["done"]:
+            return
+        _figure_backfill_state["running"] = True
+        _figure_backfill_state["date"] = date_str
+
+    def run():
+        try:
+            digest_path = get_digest_path_for_date(date_str)
+            if digest_path:
+                digest = parse_digest(digest_path)
+                # Mirror the page's scoring: apply the same day's ±star
+                # feedback adjustments so backfill targets match the cards
+                # actually marked 4-5 stars on screen.
+                try:
+                    apply_to_digest(digest, date_str)
+                except Exception:
+                    pass
+                candidates = _figure_candidates(digest)
+                fetch_figures_for_digest(
+                    [{"id": pid, "score": 5} for pid in candidates],
+                    _figures_dir(),
+                    digest_dir=_digests_dir(),
+                    digest_date=date_str,
+                )
+        except Exception:
+            pass  # figures are cosmetic; a failed backfill just leaves placeholders
+        finally:
+            with _figure_backfill_lock:
+                _figure_backfill_state["running"] = False
+                _figure_backfill_state["date"] = ""
+                _figure_backfill_state["done"].add(date_str)
+
+    Thread(target=run, daemon=True, name="figure-backfill").start()
+
+
+# --- Recommendation reason keyword highlighting -----------------------------
+
+# Generic astrophysics glossary merged with the user's interest keywords;
+# matching is longest-first, so "galaxy cluster" wins over "galaxy".
+_ASTRO_GLOSSARY = [
+    "milky way", "galaxy cluster", "galaxy formation", "galaxy evolution",
+    "globular cluster", "gravitational wave", "active galactic nucleus",
+    "supermassive black hole", "black hole", "neutron star", "white dwarf",
+    "dark matter", "dark energy", "cosmic web", "large-scale structure",
+    "interstellar medium", "molecular cloud", "star formation", "stellar halo",
+    "stellar evolution", "supernovae", "supernova", "kilonova", "pulsar",
+    "magnetar", "quasar", "redshift", "reionization", "exoplanet",
+    "protoplanetary disk", "circumstellar disk", "asteroseismology",
+    "spectroscopy", "photometry", "nucleosynthesis", "metallicity",
+    "tidal disruption event", "gamma-ray burst", "fast radio burst",
+    "cosmic microwave background", "galaxies", "galaxy",
+]
+MAX_REASON_HIGHLIGHTS = 3
+_LEARNED_KEYWORD_BOOST = 1.2
+_LEARNED_KEYWORD_LIMIT = 20
+
+
+def _reason_keywords(cfg: dict) -> list[str]:
+    """Keywords to bold in reasons: user interests + learned boosts + glossary.
+
+    Penalized learned terms (weight < 1) are deliberately excluded: bolding
+    something the user downvoted would emphasize the wrong thing.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+
+    def add(term):
+        term = (term or "").strip()
+        if len(term) < 3:
+            return
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            keywords.append(term)
+
+    for term in cfg.get("keywords") or []:
+        if isinstance(term, str):
+            add(term)
+    try:
+        learned = load_learned_profile()
+        weights = learned.get("keyword_weights") or {}
+        boosted = sorted(
+            (
+                (term, weight)
+                for term, weight in weights.items()
+                if isinstance(weight, (int, float)) and weight >= _LEARNED_KEYWORD_BOOST
+            ),
+            key=lambda item: -item[1],
+        )[:_LEARNED_KEYWORD_LIMIT]
+        for term, _weight in boosted:
+            add(term)
+    except Exception:
+        pass
+    for term in _ASTRO_GLOSSARY:
+        add(term)
+    return sorted(keywords, key=len, reverse=True)
+
+
+def _highlight_reason_text(text: str, keywords: list[str]) -> str:
+    """HTML-escape a reason and bold up to MAX_REASON_HIGHLIGHTS keywords."""
+    text = text or ""
+    if not keywords:
+        return html.escape(text)
+    # Longest first regardless of caller ordering, so phrase matches win.
+    ordered = sorted(keywords, key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(k) for k in ordered) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+    parts: list[str] = []
+    last = 0
+    hits = 0
+    for match in pattern.finditer(text):
+        if hits >= MAX_REASON_HIGHLIGHTS:
+            break
+        parts.append(html.escape(text[last:match.start()]))
+        parts.append("<b>" + html.escape(match.group(0)) + "</b>")
+        last = match.end()
+        hits += 1
+    parts.append(html.escape(text[last:]))
+    return "".join(parts)
+
+
 def _star_display(score) -> str:
     value = max(1, min(5, int(score)))
     return "★" * value + "☆" * (5 - value)
@@ -3611,6 +4059,35 @@ def _render_digest(digest=None):
     }
     today_str = _digest_today_str()
     full_abstracts = _load_full_abstracts(d.get("date", ""))
+    # Reasons with interest keywords bolded (server-rendered, escaped HTML).
+    reason_keywords = _reason_keywords(cfg)
+    reason_html = {}
+    for tier in d.get("tiers", []):
+        for p in tier.get("papers", []):
+            reason = (p.get("reason") or "").strip()
+            if reason:
+                reason_html[p.get("paper_id") or ""] = _highlight_reason_text(reason, reason_keywords)
+    # First figures for 4-5 star cards: served from the per-digest sidecar.
+    # Papers not yet recorded are backfilled in the background (digests
+    # generated before figures existed); the page polls until they land.
+    figure_sidecar = load_figure_sidecar(_digests_dir(), d.get("date", ""))
+    figure_map = figure_sidecar["papers"]
+    figure_pending = [
+        pid for pid in _figure_candidates(d)
+        if pid not in figure_map and pid not in figure_sidecar["failed"]
+    ]
+    backfill_needed = _figure_backfill_needed(_figure_candidates(d), figure_sidecar)
+    figure_backfill_active = False
+    if figure_pending or backfill_needed:
+        try:
+            digest_day = date.fromisoformat(d.get("date", ""))
+        except ValueError:
+            digest_day = date.fromisoformat(today_str)
+        if (date.fromisoformat(today_str) - digest_day).days > _FIGURE_BACKFILL_WINDOW_DAYS:
+            figure_pending = []
+        else:
+            _start_figure_backfill(d.get("date", ""))
+            figure_backfill_active = True
     # Older digests store 300-char snippets that can cut a LaTeX formula in
     # half; hide the dangling tail so no half-rendered math is ever shown.
     for tier in d.get("tiers", []):
@@ -3626,6 +4103,10 @@ def _render_digest(digest=None):
         display_categories_all=list(_DEFAULT_ARXIV_CATEGORIES),
         today_str=today_str,
         full_abstracts=full_abstracts,
+        reason_html=reason_html,
+        figure_map=figure_map,
+        figure_pending=figure_pending,
+        figure_backfill_active=figure_backfill_active,
         star_display=_star_display,
         score_counts=score_counts,
         email_configured=_email_is_configured(cfg, env_vars),
@@ -3919,6 +4400,33 @@ def digest_by_date(date_str):
         today_str=today_str,
         is_update_day=_is_arxiv_update_day(date_str)
     )
+
+
+@app.route("/figure/<path:paper_id>", defaults={"index": 1})
+@app.route("/figure/<path:paper_id>/<int:index>")
+def figure_image(paper_id, index):
+    """Serve a cached paper figure from the output figures directory."""
+    candidate = figure_path(_figures_dir(), paper_id, index)
+    if not candidate:
+        abort(404)
+    mimetype = mimetypes.guess_type(candidate)[0] or "application/octet-stream"
+    return send_file(candidate, mimetype=mimetype, conditional=True)
+
+
+@app.route("/digest/<date_str>/figures-status")
+def digest_figures_status(date_str):
+    """Backfill progress for the digest page's figure placeholders."""
+    try:
+        date.fromisoformat(date_str)
+    except ValueError:
+        abort(404)
+    with _figure_backfill_lock:
+        running = (
+            _figure_backfill_state["running"]
+            and _figure_backfill_state["date"] == date_str
+        )
+    sidecar = load_figure_sidecar(_digests_dir(), date_str)
+    return jsonify({"running": running, "figures": sidecar["papers"]})
 
 
 @app.route("/status")

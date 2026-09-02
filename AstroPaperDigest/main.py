@@ -25,6 +25,7 @@ from src.profile import build_profile, build_profile_from_config, build_profile_
 from src.zotero import ZoteroReadError
 from src.fetch_arxiv import fetch_daily_batch
 from src.ranker import APIKeyError, rank_papers
+from src.figures import MIN_SCORE as FIGURE_MIN_SCORE, fetch_figures_for_digest
 from src.output import write_bibtex, write_digest
 from src.notifier import send_digest_notification
 from src.digest_parser import parse_digest, get_latest_digest_path
@@ -167,9 +168,13 @@ def main():
     # It commits them only after the child process exits successfully, so a
     # user cancellation cannot replace an existing digest.
     staging_dir = os.environ.get("APD_OUTPUT_STAGING_DIR", "").strip()
+    # Figures already cached from earlier runs live in the live (non-staging)
+    # directory; remember it before the staging override replaces the path.
+    live_figures_dir = output_cfg.get("figures_dir", "./output/figures")
     if staging_dir:
         output_cfg["digest_dir"] = os.path.join(staging_dir, "digests")
         output_cfg["bibtex_dir"] = os.path.join(staging_dir, "bibtex")
+        output_cfg["figures_dir"] = os.path.join(staging_dir, "figures")
     configured_threshold = args.threshold if args.threshold is not None else filter_cfg.get("score_threshold", 4)
     threshold = normalize_threshold(configured_threshold)
     
@@ -372,6 +377,22 @@ def main():
     # Markdown digest - ALL papers
     digest_dir = output_cfg.get("digest_dir", "./output/digests")
     digest_path = write_digest(all_papers, digest_dir, threshold, digest_date=arxiv_date)
+
+    # First figures for recommended papers (4-5 stars) shown in the desktop
+    # digest card.  Best-effort: failures never block the digest itself.
+    if not args.dry_run:
+        print("\nFetching paper figures...")
+        try:
+            fetch_figures_for_digest(
+                all_papers,
+                output_cfg.get("figures_dir", "./output/figures"),
+                digest_dir=digest_dir,
+                digest_date=arxiv_date,
+                min_score=FIGURE_MIN_SCORE,
+                existing_dir=live_figures_dir,
+            )
+        except Exception as exc:
+            print(f"  Warning: figure fetching failed (digest saved): {exc}")
     
     # Email notification. The notification intentionally uses the complete
     # scored batch so every 5-star paper can include its full abstract, while

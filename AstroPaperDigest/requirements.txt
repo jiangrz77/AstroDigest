@@ -7,6 +7,8 @@ python-dotenv>=1.0.0
 flask>=2.0.0
 pywebview>=6,<7
 latex2mathml>=3.78,<4
+# PDF fallback for first-figure extraction (arXiv HTML is tried first).
+PyMuPDF>=1.24,<2
 # macOS (Python 3.9) needs the 11.x PyObjC line because 12.x ships no cp39 wheels.
 pyobjc-core>=11.1,<12; sys_platform == "darwin" and python_version < "3.10"
 pyobjc-framework-Cocoa>=11.1,<12; sys_platform == "darwin" and python_version < "3.10"
