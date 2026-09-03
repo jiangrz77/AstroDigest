@@ -1694,6 +1694,8 @@ textarea{height:90px;resize:vertical}
         <p class="hint">Auto = learned from your feedback; Manual = your own value (takes priority over auto). Ignore = stop this item from affecting scores; Restore auto = drop the manual value and return to the learned result.</p>
         <div id="learned-content">Loading…</div>
         <div class="row">
+          <button class="btn" type="button" id="btn-forget-keywords" onclick="resetLearned('keywords')">Forget Keywords</button>
+          <button class="btn" type="button" id="btn-forget-categories" onclick="resetLearned('categories')">Forget Categories</button>
           <button class="btn btn-primary" type="button" id="btn-reset-learned" onclick="resetLearned()">Reset All</button>
         </div>
       </div>
@@ -2003,9 +2005,18 @@ if (resendEmailButton) resendEmailButton.addEventListener('click', function () {
       post(kind, term, op);
     }
   });
-  window.resetLearned = function () {
-    if (!confirm('Reset all learned preferences? This clears your feedback history, manual settings and ignored items.')) return;
-    fetch('/learned-profile/reset', {method: 'POST'}).then(function (r) { return r.json(); }).then(function (d) {
+  window.resetLearned = function (scope) {
+    const messages = {
+      keywords: 'Forget learned KEYWORD weights? Category weights, your feedback history and manual category settings are kept. (A later rebuild from feedback may re-learn keywords.)',
+      categories: 'Forget learned CATEGORY weights? Keyword weights, your feedback history and manual keyword settings are kept.',
+      all: 'Reset all learned preferences? This clears your feedback history, manual settings and ignored items.'
+    };
+    if (!confirm(messages[scope] || messages.all)) return;
+    fetch('/learned-profile/reset', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scope: scope || 'all'})
+    }).then(function (r) { return r.json(); }).then(function (d) {
       if (d.ok) render(d.profile);
     });
   };
@@ -4699,10 +4710,21 @@ def learned_profile_update():
 
 @app.route("/learned-profile/reset", methods=["POST"])
 def learned_profile_reset():
-    """Clear feedback history, manual overrides and the learned profile."""
-    reset_learned_profile()
-    cfg, _ = _load_config_and_env()
-    profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
+    """Forget learned preferences: everything, or one dimension only.
+
+    Scoped resets (keywords / categories) keep the raw feedback history,
+    so a later manual rebuild from feedback may re-derive that dimension;
+    "all" clears the history itself.
+    """
+    scope = (request.get_json(silent=True) or {}).get("scope", "all")
+    if scope == "keywords":
+        profile = reset_learned_profile(scope="keywords")
+    elif scope == "categories":
+        profile = reset_learned_profile(scope="categories")
+    else:
+        reset_learned_profile()
+        cfg, _ = _load_config_and_env()
+        profile = rebuild_learned_profile(config_keywords=cfg.get("keywords", []))
     return jsonify({"ok": True, "profile": profile})
 
 

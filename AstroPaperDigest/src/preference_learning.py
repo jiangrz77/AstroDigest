@@ -11,6 +11,8 @@ The profile is consumed by ranker.py to (a) inject explicit numeric weights
 into the LLM prompt and (b) apply a bounded deterministic score adjustment.
 """
 
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -73,8 +75,12 @@ def save_feedback(feedback: list, path: str = FEEDBACK_FILE) -> None:
         json.dump(feedback, f, indent=2, ensure_ascii=False)
 
 
-def load_learned_profile(path: str = LEARNED_PROFILE_FILE):
-    """Return the persisted learned profile, or None if missing/corrupt."""
+def load_learned_profile(path: str | None = None):
+    """Return the persisted learned profile, or None if missing/corrupt.
+
+    The path resolves at call time so tests can repoint the module global.
+    """
+    path = path or LEARNED_PROFILE_FILE
     if not os.path.exists(path):
         return None
     try:
@@ -84,16 +90,43 @@ def load_learned_profile(path: str = LEARNED_PROFILE_FILE):
         return None
 
 
-def save_learned_profile(profile: dict, path: str = LEARNED_PROFILE_FILE) -> None:
+def save_learned_profile(profile: dict, path: str | None = None) -> None:
+    path = path or LEARNED_PROFILE_FILE
     with open(path, "w", encoding="utf-8") as f:
         json.dump(profile, f, indent=2, ensure_ascii=False)
 
 
-def reset_learned_profile() -> None:
-    """Clear feedback history and the learned profile (full reset)."""
-    save_feedback([])
-    if os.path.exists(LEARNED_PROFILE_FILE):
-        os.remove(LEARNED_PROFILE_FILE)
+def reset_learned_profile(scope: str = "all") -> dict:
+    """Forget learned preferences, wholly or in one dimension.
+
+    - "all": clear feedback history and remove the learned profile file
+      (the previous full-reset behaviour).
+    - "keywords" / "categories": drop that dimension only — learned weights
+      and manual overrides/ignored entries for the dimension are removed
+      while the other dimension and the raw feedback history stay intact.
+      (A later manual rebuild from feedback may re-derive terms for the
+      forgotten dimension; Reset All is what clears the history itself.)
+
+    Returns the profile that should be shown next (a fresh derive for
+    scoped resets).
+    """
+    scope = scope if scope in ("keywords", "categories") else "all"
+    if scope == "all":
+        save_feedback([])
+        if os.path.exists(LEARNED_PROFILE_FILE):
+            os.remove(LEARNED_PROFILE_FILE)
+        return {}
+
+    existing = load_learned_profile() or {}
+    weights_key = {"keywords": "keyword_weights",
+                   "categories": "category_weights"}[scope]
+    existing[weights_key] = {}
+    manual = dict(existing.get("manual") or {})
+    manual[weights_key] = {}
+    existing["manual"] = manual
+    existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_learned_profile(existing)
+    return existing
 
 
 # --- Text helpers -----------------------------------------------------------

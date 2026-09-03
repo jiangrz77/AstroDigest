@@ -161,12 +161,64 @@ def test_discover_terms_requires_two_papers():
     print("  PASSED (discover terms requires two papers)")
 
 
+def test_scoped_reset():
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old_feedback, old_profile = pl.FEEDBACK_FILE, pl.LEARNED_PROFILE_FILE
+        pl.FEEDBACK_FILE = os.path.join(tmp, "feedback.json")
+        pl.LEARNED_PROFILE_FILE = os.path.join(tmp, "learned_profile.json")
+        try:
+            profile = {
+                "keyword_weights": {"supernova": 1.4, "pulsar": 0.6},
+                "category_weights": {"astro-ph.HE": 1.3},
+                "global_calibration": 0.05,
+                "manual": {
+                    "keyword_weights": {"ignored-term": None},
+                    "category_weights": {"astro-ph.SR": 1.8},
+                },
+                "tuning_version": pl.TUNING_VERSION,
+            }
+            pl.save_learned_profile(profile)
+            pl.save_feedback([{"title": "t", "action": "underrated",
+                               "original_score": 3, "date": _ts(1)}])
+
+            kept = pl.reset_learned_profile(scope="categories")
+            assert kept["category_weights"] == {}, "category weights should be cleared"
+            assert kept["manual"]["category_weights"] == {}
+            assert kept["keyword_weights"] == {"supernova": 1.4, "pulsar": 0.6}, \
+                "keyword weights must survive a category reset"
+            assert kept["manual"]["keyword_weights"] == {"ignored-term": None}
+            assert len(pl.load_feedback()) == 1, "scoped reset keeps feedback history"
+
+            # keyword scope mirrors it
+            pl.save_learned_profile(profile)
+            kept = pl.reset_learned_profile(scope="keywords")
+            assert kept["keyword_weights"] == {}
+            assert kept["manual"]["keyword_weights"] == {}
+            assert kept["category_weights"] == {"astro-ph.HE": 1.3}
+            assert kept["manual"]["category_weights"] == {"astro-ph.SR": 1.8}
+            assert len(pl.load_feedback()) == 1
+
+            # unknown scope falls back to the full reset
+            pl.save_learned_profile(profile)
+            out = pl.reset_learned_profile(scope="bogus")
+            assert out == {}
+            assert pl.load_learned_profile() is None
+            assert pl.load_feedback() == []
+        finally:
+            pl.FEEDBACK_FILE, pl.LEARNED_PROFILE_FILE = old_feedback, old_profile
+    print("  PASSED (scoped_reset)")
+
+
 if __name__ == "__main__":
     tests = [test_matches_term, test_extract_keyword_matches, test_derive_underrated_boosts,
              test_derive_overrated_penalizes, test_conflict_latest_wins,
              test_same_direction_chains_and_clamps, test_decay_moves_toward_neutral,
              test_manual_override_and_suppress, test_compute_adjustment_and_clamp,
-             test_format_learned_weights_block, test_discover_terms_requires_two_papers]
+             test_format_learned_weights_block, test_discover_terms_requires_two_papers,
+             test_scoped_reset]
     passed = 0
     failed = 0
     for t in tests:
