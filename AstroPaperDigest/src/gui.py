@@ -731,6 +731,10 @@ def check_setup():
 def inject_update_banner(response):
     """Attach the update banner to every rendered page."""
     if response.mimetype == "text/html":
+        # Digest pages change server-side (feedback adjustments re-render
+        # scores/colours); a webview cache would show stale colours after a
+        # reload, so never let HTML be cached.
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         content = response.get_data(as_text=True)
         if "</body>" in content:
             inject = f"{_UPDATE_BANNER_SCRIPT}\n</body>"
@@ -2649,7 +2653,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
       <div class="card-figure card-figure-loading" data-figure-pid="{{ paper.paper_id }}" title="Fetching figure…"></div>
       {% endif %}
     {% endif %}
-    {% if paper.reason and not paper.scoring_failed and paper.score|int >= 4 %}{% set reason_kind = 'strong' if paper.score|int == 5 else 'high' %}<div class="card-reason reason-{{ reason_kind }}"><span class="reason-label">Match</span><span class="reason-text">{{ reason_html.get(paper.paper_id, '') | safe }}</span></div>{% endif %}
+    {% if paper.reason and not paper.scoring_failed %}{% set reason_kind = 'strong' if paper.score|int == 5 else ('high' if paper.score|int == 4 else 'medium') %}<div class="card-reason reason-{{ reason_kind }}" data-role="reason" {% if paper.score|int < 4 %}hidden{% endif %}><span class="reason-label">Match</span><span class="reason-text">{{ reason_html.get(paper.paper_id, '') | safe }}</span></div>{% endif %}
     <div class="card-meta">{{ paper.authors[:80] }}{% if paper.categories %} &nbsp;|&nbsp; {{ paper.categories }}{% endif %}</div>
     {% if paper.abstract %}<div class="card-abstract"><span class="abstract-label">Abstract</span>{{ full_abstracts.get(paper.paper_id, paper.abstract) }}</div>{% endif %}
     <div class="card-actions">
@@ -3089,12 +3093,27 @@ function moveCardToTier(card, score) {
 }
 function updateCardScore(card, score) {
   const badge = card.querySelector('[data-role="score"]');
-  if (!badge) return;
-  badge.innerHTML = '<span class="stars-filled">' + '★'.repeat(score) + '</span><span class="stars-empty">' + '☆'.repeat(5 - score) + '</span>';
-  badge.setAttribute('aria-label', score + ' out of 5 stars');
-  badge.classList.remove('score-strong', 'score-high', 'score-three', 'score-two', 'score-low');
-  badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score === 3 ? 'score-three' : (score === 2 ? 'score-two' : 'score-low'))));
+  if (badge) {
+    badge.innerHTML = '<span class="stars-filled">' + '★'.repeat(score) + '</span><span class="stars-empty">' + '☆'.repeat(5 - score) + '</span>';
+    badge.setAttribute('aria-label', score + ' out of 5 stars');
+    badge.classList.remove('score-strong', 'score-high', 'score-three', 'score-two', 'score-low');
+    badge.classList.add(score === 5 ? 'score-strong' : (score === 4 ? 'score-high' : (score === 3 ? 'score-three' : (score === 2 ? 'score-two' : 'score-low'))));
+  }
   card.dataset.score = String(score);
+  // Keep the MATCH banner's tier colour and visibility in step with the
+  // new score (amber for 5, green for 4, hidden below 4).
+  const reason = card.querySelector('[data-role="reason"]');
+  if (reason) {
+    reason.classList.remove('reason-strong', 'reason-high', 'reason-medium');
+    if (score >= 4) {
+      reason.classList.add(score === 5 ? 'reason-strong' : 'reason-high');
+      reason.hidden = false;
+    } else {
+      reason.classList.add('reason-medium');
+      reason.hidden = true;
+    }
+  }
+  layoutFigures();
 }
 function updateFeedbackButtons(card) {
   const score = Number(card.dataset.score || 0);
