@@ -48,6 +48,7 @@ from src.figures import (
     CAPTION_VERSION,
     MAX_FIGURES,
     MIN_SCORE as FIGURE_MIN_SCORE,
+    PARSER_VERSION,
     fetch_figures_for_digest,
     figure_path,
     load_sidecar as load_figure_sidecar,
@@ -3505,10 +3506,37 @@ setTimeout(layoutFigures, 400);
       return;
     }
     const holder = document.querySelector('.card-figure-loading[data-figure-pid="' + pid + '"]');
-    if (!holder) return;
+    if (holder) {
+      const anchor = document.createElement('a');
+      anchor.className = 'card-figure';
+      anchor.setAttribute('role', 'button');
+      anchor.title = 'View figures';
+      anchor.dataset.figurePid = pid;
+      anchor.dataset.figureCount = String(count);
+      anchor.dataset.captions = JSON.stringify((entry && entry.captions) || []);
+      const img = document.createElement('img');
+      img.src = '/figure/' + encodeURIComponent(pid);
+      img.alt = 'First figure';
+      img.addEventListener('load', layoutFigures);
+      anchor.appendChild(img);
+      if (count > 1) {
+        const badge = document.createElement('span');
+        badge.className = 'figure-badge';
+        badge.textContent = '+' + (count - 1);
+        anchor.appendChild(badge);
+      }
+      holder.replaceWith(anchor);
+      return;
+    }
+    // Recovered after a parser-upgrade retry: the card never had a figure
+    // element, so build one and slide it in below the title.
+    const card = document.getElementById('card-' + pid.replace(/\./g, '-'));
+    const title = card && card.querySelector('.card-title');
+    if (!card || !title) return;
     const anchor = document.createElement('a');
     anchor.className = 'card-figure';
     anchor.setAttribute('role', 'button');
+    anchor.tabIndex = 0;
     anchor.title = 'View figures';
     anchor.dataset.figurePid = pid;
     anchor.dataset.figureCount = String(count);
@@ -3524,7 +3552,7 @@ setTimeout(layoutFigures, 400);
       badge.textContent = '+' + (count - 1);
       anchor.appendChild(badge);
     }
-    holder.replaceWith(anchor);
+    title.insertAdjacentElement('afterend', anchor);
   }
   function finish() {
     document.querySelectorAll('.card-figure-loading').forEach(function (holder) { holder.remove(); });
@@ -3896,7 +3924,10 @@ def _figure_candidates(digest: dict) -> list[str]:
 
 def _figure_backfill_needed(candidates: list[str], sidecar: dict) -> bool:
     """True when any candidate lacks an entry, was fetched at a lower
-    gallery depth than the current MAX_FIGURES, or predates captions."""
+    gallery depth than the current MAX_FIGURES, predates captions, or was
+    failed by an older figure parser (those get one retry per upgrade)."""
+    if sidecar.get("pv", 1) < PARSER_VERSION:
+        return True
     for pid in candidates:
         if pid in sidecar["failed"]:
             continue

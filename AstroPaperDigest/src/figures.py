@@ -49,6 +49,11 @@ MAX_FIGURES = 24
 # HTML page is refetched for caption text; cached images are not redownloaded).
 CAPTION_VERSION = 1
 
+# Parser version: bumped when figure parsing gains a new capability, so
+# papers previously misrecorded as figure-less get one retry.  v2 added
+# <object>-embedded SVG figures (newer LaTeXML renderings).
+PARSER_VERSION = 2
+
 PAGE_TIMEOUT = (10, 30)
 IMAGE_TIMEOUT = (10, 60)
 PDF_TIMEOUT = (10, 180)
@@ -75,6 +80,10 @@ _CONTENT_TYPE_EXT = {
 _FIGURE_BLOCK_RE = re.compile(r"<figure\b[^>]*>(.*?)</figure>", re.IGNORECASE | re.DOTALL)
 _FIGCAPTION_RE = re.compile(r"<figcaption\b[^>]*>(.*?)</figcaption>", re.IGNORECASE | re.DOTALL)
 _IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+# Newer LaTeXML renderings embed SVG figures as <object data="..."> instead
+# of <img src="...">; both carry class ltx_graphics.
+_OBJECT_TAG_RE = re.compile(r"<object\b[^>]*>", re.IGNORECASE)
+_DATA_ATTR_RE = re.compile(r"\bdata=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _SRC_ATTR_RE = re.compile(r"\bsrc=[\"']([^\"']+)[\"']", re.IGNORECASE)
 _CLASS_ATTR_RE = re.compile(r"\bclass=[\"']([^\"']*)[\"']", re.IGNORECASE)
 # MathML renderings embed the raw TeX in <annotation>; it is noise in a
@@ -127,21 +136,35 @@ def _caption_text(fragment: str) -> str:
     return text[:600]
 
 
+def _graphic_src(tag: str):
+    """Figure resource URL from an <img src=...> or <object data=...> tag."""
+    if tag.lower().startswith("<object"):
+        match = _DATA_ATTR_RE.search(tag)
+    else:
+        match = _SRC_ATTR_RE.search(tag)
+    return match.group(1).strip() if match else None
+
+
+def _is_ltx_graphic(tag: str) -> bool:
+    classes = _CLASS_ATTR_RE.search(tag)
+    return bool(classes and "ltx_graphics" in classes.group(1))
+
+
 def parse_figure_items(html_text: str, limit: int | None = None) -> list[tuple[str, str]]:
     """(src, caption) pairs from an arXiv HTML page, in document order.
 
     LaTeXML renders figures as <figure> blocks whose graphics are <img>
-    tags (class ltx_graphics) with page-relative srcs such as "x1.png"; a
-    block may contain several subpanel images, which all share the block's
-    <figcaption>.  Falls back to standalone ltx_graphics <img> tags (no
-    caption) when no figure blocks carry images.  Site chrome icons live
-    outside figures and are skipped.
+    tags or <object data=...> elements (class ltx_graphics) with
+    page-relative srcs such as "x1.png"; a block may contain several
+    subpanel images, which all share the block's <figcaption>.  Falls back
+    to standalone ltx_graphics elements (no caption) when no figure blocks
+    carry images.  Site chrome icons live outside figures and are skipped.
     """
     items: list[tuple[str, str]] = []
     seen: set[str] = set()
 
     def collect(tag: str, caption: str) -> bool:
-        src = _src_of_tag(tag)
+        src = _graphic_src(tag)
         if src and not src.startswith("data:") and src not in seen:
             seen.add(src)
             items.append((src, caption))
@@ -154,11 +177,17 @@ def parse_figure_items(html_text: str, limit: int | None = None) -> list[tuple[s
         for tag in _IMG_TAG_RE.findall(block):
             if collect(tag, caption):
                 return items
+        for tag in _OBJECT_TAG_RE.findall(block):
+            if collect(tag, caption):
+                return items
     if items:
         return items
     for tag in _IMG_TAG_RE.findall(html_text):
-        classes = _CLASS_ATTR_RE.search(tag)
-        if classes and "ltx_graphics" in classes.group(1):
+        if _is_ltx_graphic(tag):
+            if collect(tag, ""):
+                return items
+    for tag in _OBJECT_TAG_RE.findall(html_text):
+        if _is_ltx_graphic(tag):
             if collect(tag, ""):
                 return items
     return items
@@ -173,11 +202,6 @@ def parse_first_figure_src(html: str):
     """Back-compat single-figure variant of parse_figure_srcs."""
     srcs = parse_figure_srcs(html, 1)
     return srcs[0] if srcs else None
-
-
-def _src_of_tag(tag: str):
-    match = _SRC_ATTR_RE.search(tag)
-    return match.group(1).strip() if match else None
 
 
 def new_session() -> requests.Session:
@@ -400,7 +424,8 @@ def load_sidecar(digest_dir: str, digest_date: str) -> dict:
             "capv": capv,
         }
     failed = raw.get("failed") if isinstance(raw.get("failed"), dict) else {}
-    return {"papers": papers, "failed": failed}
+    pv = raw.get("pv") if isinstance(raw.get("pv"), int) else 1
+    return {"papers": papers, "failed": failed, "pv": pv}
 
 
 def write_sidecar(digest_dir: str, digest_date: str, data: dict) -> None:
@@ -446,7 +471,17 @@ def fetch_figures_for_digest(
     only their missing figures.
     """
     session = session or new_session()
-    sidecar = load_sidecar(digest_dir, digest_date) if digest_dir else {"papers": {}, "failed": {}}
+    sidecar = load_sidecar(digest_dir, digest_date) if digest_dir else {"papers": {}, "failed": {}, "pv": PARSER_VERSION}
+    # A parser upgrade may recover papers misrecorded as figure-less: retry
+    # those failures once per version (genuinely figure-less papers simply
+    # fail again and stay recorded at the current version).
+    if sidecar.get("pv", 1) < PARSER_VERSION:
+        sidecar["failed"] = {
+            pid: reason
+            for pid, reason in sidecar.get("failed", {}).items()
+            if reason not in ("no_figure", "no_html_figure")
+        }
+    sidecar["pv"] = PARSER_VERSION
     targets = [
         p for p in papers
         if not p.get("scoring_failed")

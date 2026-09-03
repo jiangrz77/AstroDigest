@@ -47,6 +47,16 @@ HTML_WITH_CAPTIONS = """
 </figure>
 """
 
+HTML_WITH_OBJECT_FIGURES = """
+<figure id="S3.F1" class="ltx_figure">
+  <object type="image/svg+xml" data="2609.01801v1/b6b4abon.svg" id="S3.F1.g1" class="ltx_graphics ltx_img_square" width="354" height="352"></object>
+  <figcaption class="ltx_caption"><span class="ltx_tag ltx_tag_figure">Figure 1: </span>Spectroscopic equilibrium.</figcaption>
+</figure>
+<figure id="S3.F2" class="ltx_figure">
+  <object type="image/svg+xml" data="x2.svg" class="ltx_graphics"></object>
+</figure>
+"""
+
 
 class ParseFirstFigureTests(unittest.TestCase):
     def test_returns_first_figure_image_src(self):
@@ -67,6 +77,16 @@ class ParseFirstFigureTests(unittest.TestCase):
         self.assertNotIn("<", first)          # all markup stripped
         second = items[1][1]
         self.assertEqual(second, "Second & final figure.")  # entities decoded
+
+    def test_object_embedded_svg_figures(self):
+        # Newer LaTeXML renderings embed figures as <object data=...> instead
+        # of <img src=...>; missing them misrecorded papers as figure-less.
+        items = figures.parse_figure_items(HTML_WITH_OBJECT_FIGURES)
+        self.assertEqual(
+            [src for src, _cap in items],
+            ["2609.01801v1/b6b4abon.svg", "x2.svg"],
+        )
+        self.assertIn("Spectroscopic equilibrium", items[0][1])
 
     def test_skips_data_uris(self):
         self.assertEqual(figures.parse_first_figure_src(HTML_WITH_DATA_URI_ONLY), "x3.png")
@@ -113,7 +133,8 @@ class SidecarTests(unittest.TestCase):
     def test_roundtrip_and_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
-                figures.load_sidecar(tmp, "2026-09-02"), {"papers": {}, "failed": {}}
+                figures.load_sidecar(tmp, "2026-09-02"),
+                {"papers": {}, "failed": {}, "pv": 1},
             )
             data = {"papers": {"2609.01208v1": {"source": "html", "file": "x.png"}},
                     "failed": {"old1": "no_figure"}}
@@ -127,6 +148,7 @@ class SidecarTests(unittest.TestCase):
                         "captions": [""], "capv": 0,
                     }},
                     "failed": {"old1": "no_figure"},
+                    "pv": 1,
                 },
             )
 
@@ -185,6 +207,52 @@ class FetchFiguresForDigestTests(unittest.TestCase):
                     max_figures=1,
                 )
             fetch.assert_not_called()
+
+    def test_parser_upgrade_retries_figureless_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            figures_dir = os.path.join(tmp, "figures")
+            digests = os.path.join(tmp, "digests")
+            # A failure recorded by parser v1: with PARSER_VERSION now 2 the
+            # entry must be retried once instead of skipped forever.
+            figures.write_sidecar(digests, "2026-09-02", {
+                "papers": {},
+                "failed": {"retryme": "no_figure", "hardfail": "write_error"},
+                "pv": 1,
+            })
+            with patch.object(figures, "REQUEST_INTERVAL", 0), \
+                 patch.object(figures, "PARSER_VERSION", 2), \
+                 patch.object(
+                     figures, "fetch_paper_figure",
+                     return_value={"figures": [(b"N", ".png")],
+                                   "captions": ["now found"], "source": "html"},
+                 ) as fetch:
+                sidecar = figures.fetch_figures_for_digest(
+                    [self._paper("retryme", 5), self._paper("hardfail", 5)],
+                    figures_dir,
+                    digest_dir=digests,
+                    digest_date="2026-09-02",
+                    max_figures=1,
+                )
+            fetch.assert_called_once()  # hardfail (write_error) stays skipped
+            self.assertIn("retryme", sidecar["papers"])
+            self.assertNotIn("retryme", sidecar["failed"])
+            self.assertEqual(sidecar["failed"], {"hardfail": "write_error"})
+            self.assertEqual(sidecar["pv"], 2)
+            # A second run at the current version records the entry complete
+            # (depth 1 = max_figures 1, captions current) and skips it.
+            with patch.object(figures, "REQUEST_INTERVAL", 0), \
+                 patch.object(figures, "fetch_paper_figure") as fetch2:
+                sidecar = figures.fetch_figures_for_digest(
+                    [self._paper("retryme", 5)],
+                    figures_dir,
+                    digest_dir=digests,
+                    digest_date="2026-09-02",
+                    max_figures=1,
+                )
+            fetch2.assert_not_called()
+            self.assertIn("retryme", sidecar["papers"])
+            self.assertNotIn("retryme", sidecar["failed"])
+            self.assertEqual(sidecar["pv"], 2)
 
     def test_cached_figure_refreshes_captions_without_downloads(self):
         with tempfile.TemporaryDirectory() as tmp:
