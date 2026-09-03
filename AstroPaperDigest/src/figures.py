@@ -38,10 +38,12 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 # Papers below this final score get no figures.
 MIN_SCORE = 4
 
-# Gallery depth: figures fetched per paper.  Recorded sidecar entries carry
-# the depth they were fetched with; bumping this value makes existing
-# entries fetch only their missing figures.
-MAX_FIGURES = 3
+# Gallery depth: figures fetched per paper — ALL of the paper's figures,
+# bounded as a sanity cap (arXiv papers rarely exceed ~20 figures; the bound
+# also keeps a pathological PDF extraction from running away).  Recorded
+# sidecar entries carry the depth they were fetched with; raising this value
+# makes existing entries fetch only their missing figures.
+MAX_FIGURES = 24
 
 # Sidecar schema version for captions: entries below it get refreshed (the
 # HTML page is refetched for caption text; cached images are not redownloaded).
