@@ -32,6 +32,46 @@ RETRY_ATTEMPTS = 1       # extra attempt after the first failure (one retry)
 RETRY_BACKOFF = 3.0      # seconds before a normal retry
 RETRY_BACKOFF_429 = 30.0 # seconds before a retry after HTTP 429 (rate limited)
 MAX_ATTEMPTS_429 = 3     # total tries for rate-limited calls (initial + 2 retries)
+MAX_TOKENS = 16384       # output budget; generous so occasional reasoning can't starve the JSON
+
+# Reasoning models count chain-of-thought tokens against max_tokens, and
+# deepseek-v4-flash-vision-exp occasionally spent the whole 8192 budget
+# thinking before emitting anything (empty content, finish_reason=length),
+# which surfaced as a misleading "Expected JSON array" failure.  Thinking is
+# useless for "emit a JSON array", so switch it off; providers that reject
+# the parameter fall back to a plain request transparently.
+_DISABLE_THINKING = {"thinking": {"type": "disabled"}}
+_thinking_param_unsupported = False
+
+
+def _create_completion(client: OpenAI, model: str, messages: list):
+    """Chat completion with thinking disabled where the API supports it."""
+    global _thinking_param_unsupported
+    if not _thinking_param_unsupported:
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=MAX_TOKENS,
+                extra_body=_DISABLE_THINKING,
+            )
+        except Exception as e:
+            rejected_param = (
+                getattr(e, "status_code", None) in (400, 422)
+                or "thinking" in str(e).lower()
+                or "extra_body" in str(e).lower()
+                or "unrecognized" in str(e).lower()
+            )
+            if not rejected_param:
+                raise
+            _thinking_param_unsupported = True
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=MAX_TOKENS,
+    )
 
 
 class APIKeyError(ValueError):
@@ -303,17 +343,26 @@ def rank_papers(
         last_error = ""
         for attempt in range(max(RETRY_ATTEMPTS + 1, MAX_ATTEMPTS_429)):
             try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=8192,
-                )
+                response = _create_completion(client, model, messages)
                 content = response.choices[0].message.content
                 if content is None:
                     raise ValueError("Empty LLM response")
                 content = content.strip()
-                items, recovered_partial = _parse_score_response(content)
+                if not content:
+                    finish = getattr(response.choices[0], "finish_reason", "?")
+                    raise ValueError(
+                        "LLM produced no output (finish_reason="
+                        f"{finish}); its reasoning consumed the token budget"
+                    )
+                try:
+                    items, recovered_partial = _parse_score_response(content)
+                except ValueError as e:
+                    # Keep a snippet of the raw reply so the retry log shows
+                    # what the model actually answered instead of a bare
+                    # "Expected JSON array".
+                    raise ValueError(
+                        f"{e} — response began with: {content[:120]!r}"
+                    ) from None
                 if recovered_partial:
                     log(
                         f"  Recovered {len(items)} complete scores from a partial "
