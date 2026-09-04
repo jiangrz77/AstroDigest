@@ -1061,11 +1061,11 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                 )
             elif "HTTPError" in stdout and "429" in stdout:
                 _pipeline_message = (
-                    "arXiv API rate limit exceeded (HTTP 429).\n\n"
-                    "To avoid adding more load, AstroPaperDigest stopped "
-                    "without automatic retries.\n\n"
-                    "Please wait at least five minutes before running again. "
-                    "Repeatedly clicking Re-run will extend the problem."
+                    "arXiv API rate limit (HTTP 429).\n\n"
+                    "AstroPaperDigest retried with increasing backoff waits, but "
+                    "arXiv kept rejecting requests from this network.\n\n"
+                    "Wait several minutes before running again. Repeatedly "
+                    "clicking Re-run immediately will extend the limit."
                 )
             else:
                 if "ERROR:" in stdout:

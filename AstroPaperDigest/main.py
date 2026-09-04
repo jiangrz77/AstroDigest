@@ -244,7 +244,12 @@ def main():
         )
     except Exception as e:
         print(f"ERROR: Failed to fetch papers from arXiv: {e}")
-        print("Check your network/proxy settings and try again.")
+        if getattr(e, "status", None) == 429:
+            print("arXiv is rate-limiting API requests from this network (HTTP 429),")
+            print("and kept doing so even after polite backoff retries.")
+            print("Wait several minutes before re-running; immediate re-runs extend the limit.")
+        else:
+            print("Check your network/proxy settings and try again.")
         sys.exit(2)
 
     status = result["status"]

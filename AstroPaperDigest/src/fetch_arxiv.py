@@ -57,13 +57,22 @@ _ID_LIST_BATCH_SIZE = 50
 # reported as an error.
 _FETCH_BATCH_TIMEOUT = 120
 _RATE_LIMIT_LOCK_TIMEOUT = 30
+# Since ~Feb 2026 arXiv enforces its API rate limits far more aggressively:
+# even a compliantly paced (3.1s) client sees transient HTTP 429 responses.
+# Retry politely with escalating waits, honouring the server's Retry-After
+# hint when one is sent.  The total wait is capped so rate-limit backoffs can
+# never exceed the GUI pipeline's subprocess timeout (15 minutes).
+_RATE_LIMIT_MAX_RETRIES = 4
+_RATE_LIMIT_BACKOFF_SECONDS = (30, 60, 120, 180)
+_RATE_LIMIT_BACKOFF_CAP = 300
+_RATE_LIMIT_TOTAL_BUDGET = 480
 from src import paths as _paths
 _PROJECT_DIR = _paths.data_dir()
 (_PROJECT_DIR / "output").mkdir(parents=True, exist_ok=True)
 _RATE_LIMIT_FILE = _PROJECT_DIR / "output" / ".arxiv_api_rate_limit"
 _API_THREAD_LOCK = Lock()
 _RECENT_LIST_URL = "https://arxiv.org/list/astro-ph/recent?skip=0&show=2000"
-_ARXIV_USER_AGENT = "AstroPaperDigest/1.0.3"
+_ARXIV_USER_AGENT = "AstroPaperDigest/2.3.3"
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = (
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -114,6 +123,53 @@ def _api_request_session():
                 fcntl.flock(state.fileno(), fcntl.LOCK_UN)
 
 
+def _parse_retry_after(response) -> Optional[float]:
+    """Seconds from a numeric Retry-After header, or None when absent/undecodable."""
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(1.0, float(value))
+    except (TypeError, ValueError):
+        # HTTP-date form (rare); fall back to the fixed backoff schedule.
+        return None
+
+
+class _RateLimitBudget:
+    """Bounded, escalating backoff waits for HTTP 429 responses.
+
+    One budget covers a whole fetch operation (batches plus single-ID
+    retries), so a persistently throttled run still terminates quickly: the
+    number of waits, each wait, and their sum are all capped.
+    """
+
+    def __init__(self):
+        self.waits = 0
+        self.total_wait = 0.0
+
+    def next_wait(self, client) -> Optional[float]:
+        """Return the next backoff in seconds, or None when exhausted.
+
+        Honours the Retry-After header captured from the latest 429 response
+        (see ``_new_client``) when it asks for longer than the scheduled
+        backoff, capped so a single bogus header cannot stall the pipeline.
+        """
+        if self.waits >= _RATE_LIMIT_MAX_RETRIES:
+            return None
+        scheduled = _RATE_LIMIT_BACKOFF_SECONDS[
+            min(self.waits, len(_RATE_LIMIT_BACKOFF_SECONDS) - 1)
+        ]
+        retry_after = getattr(client, "_last_429_retry_after", None) or 0.0
+        desired = min(max(scheduled, retry_after), _RATE_LIMIT_BACKOFF_CAP)
+        remaining = _RATE_LIMIT_TOTAL_BUDGET - self.total_wait
+        if remaining < scheduled:
+            return None
+        wait = min(desired, remaining)
+        self.waits += 1
+        self.total_wait += wait
+        return wait
+
+
 def _new_client(trust_env: bool = True) -> arxiv.Client:
     """Create a single-connection client with compliant page pacing.
 
@@ -127,6 +183,10 @@ def _new_client(trust_env: bool = True) -> arxiv.Client:
         num_retries=0,
     )
     client._session.trust_env = trust_env
+    # The arxiv library raises HTTPError without the response headers, which
+    # would discard the Retry-After hint arXiv sends with HTTP 429; capture it
+    # on the client so _RateLimitBudget can honour the server's ask.
+    client._last_429_retry_after = None
     # The arxiv library issues requests without a timeout; a stalled proxy or
     # network can hang the pipeline for minutes. Enforce our own timeout so
     # failures surface quickly instead of blocking forever.
@@ -134,7 +194,10 @@ def _new_client(trust_env: bool = True) -> arxiv.Client:
 
     def get_with_timeout(url, **kwargs):
         kwargs.setdefault("timeout", 30)
-        return original_get(url, **kwargs)
+        response = original_get(url, **kwargs)
+        if response.status_code == 429:
+            client._last_429_retry_after = _parse_retry_after(response)
+        return response
 
     client._session.get = get_with_timeout
     return client
@@ -321,7 +384,9 @@ def _fetch_listed_papers(
     """Fetch metadata for the exact IDs published in an official listing.
 
     The id_list is fetched in small batches: arXiv rate-limits large id_list
-    requests, and the shared 3.1s limiter applies between batches.
+    requests, and the shared 3.1s limiter applies between batches.  Transient
+    HTTP 429 responses are retried with escalating, Retry-After-aware backoffs
+    under a single bounded budget shared by the batch and single-ID phases.
     """
     if not ids:
         return []
@@ -331,12 +396,14 @@ def _fetch_listed_papers(
     total_ids = len(ids)
     requested_ids = {re.sub(r"v\d+$", "", paper_id) for paper_id in ids}
     returned_ids = set()
+    rate_limits = _RateLimitBudget()
     emit("fetch", 0, total_ids, f"Fetching metadata for {total_ids} official arXiv papers…")
 
     for start in range(0, len(ids), _ID_LIST_BATCH_SIZE):
         batch = ids[start:start + _ID_LIST_BATCH_SIZE]
         search = arxiv.Search(id_list=batch, max_results=len(batch))
-        for attempt in range(2):
+        connection_attempts = 0
+        while True:
             try:
                 batch_deadline = time.monotonic() + _FETCH_BATCH_TIMEOUT
                 with _api_request_session():
@@ -364,24 +431,31 @@ def _fetch_listed_papers(
                             )
                 break
             except requests.exceptions.ProxyError:
-                if trust_env and attempt == 0:
+                if trust_env and connection_attempts == 0:
                     # The system proxy is unreachable; retry directly.
+                    connection_attempts += 1
                     print("  Proxy connection failed; retrying without the system proxy...")
                     client = _new_client(trust_env=False)
                     continue
                 raise
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                if attempt == 0:
+                if connection_attempts == 0:
+                    connection_attempts += 1
                     print(f"  arXiv API connection error; retrying once ({e})...")
                     time.sleep(5)
                     continue
                 raise
             except arxiv.HTTPError as e:
-                if e.status == 429 and attempt == 0:
-                    # A single polite retry after a backoff; never hammer.
-                    print("  arXiv API rate limited; waiting 30s before one retry...")
-                    time.sleep(30)
-                    continue
+                if e.status == 429:
+                    wait = rate_limits.next_wait(client)
+                    if wait is not None:
+                        print(
+                            f"  arXiv API rate limited; waiting {wait:.0f}s before "
+                            f"retry {rate_limits.waits}/{_RATE_LIMIT_MAX_RETRIES}..."
+                        )
+                        time.sleep(wait)
+                        continue
+                    print("  arXiv API still rate limited after polite backoffs; giving up.")
                 raise
 
     # arXiv's id_list API intermittently omits some listed IDs; retry only
@@ -394,11 +468,13 @@ def _fetch_listed_papers(
     if missing:
         print(f"  {len(missing)} metadata record(s) missing from the batch response; "
               "retrying individually ...")
-        for i in missing:
+        index = 0
+        while index < len(missing):
+            paper_id = missing[index]
             try:
                 single_deadline = time.monotonic() + _FETCH_BATCH_TIMEOUT
                 with _api_request_session():
-                    for result in client.results(arxiv.Search(id_list=[i], max_results=1)):
+                    for result in client.results(arxiv.Search(id_list=[paper_id], max_results=1)):
                         if time.monotonic() > single_deadline:
                             raise requests.exceptions.Timeout(
                                 f"single-id arXiv query timed out after {_FETCH_BATCH_TIMEOUT}s"
@@ -414,8 +490,23 @@ def _fetch_listed_papers(
                         )
                         if item is not None:
                             papers_by_id.setdefault(item["base_id"], item["paper"])
+                index += 1
+            except arxiv.HTTPError as e:
+                if e.status == 429:
+                    wait = rate_limits.next_wait(client)
+                    if wait is not None:
+                        print(
+                            f"  arXiv API rate limited; waiting {wait:.0f}s before "
+                            f"retry {rate_limits.waits}/{_RATE_LIMIT_MAX_RETRIES}..."
+                        )
+                        time.sleep(wait)
+                        continue
+                    print("  arXiv API still rate limited; skipping the remaining "
+                          "single-ID retries.")
+                    break
+                index += 1
             except Exception:
-                pass
+                index += 1
 
     emit(
         "fetch", len(returned_ids), total_ids,
@@ -555,6 +646,10 @@ def _fetch_api_window(
     client = _new_client()
     proxy_retried = False
     effective_max = max_results
+    rate_limits = _RateLimitBudget()
+    # Accumulate across retries: results are deduplicated by base_id, so a
+    # rate-limit retry resumes with the pages it already fetched.
+    papers_by_id = {}
     fetched = 0
 
     submitted_search = arxiv.Search(
@@ -578,8 +673,6 @@ def _fetch_api_window(
 
     attempt = 0
     while attempt < max_retries:
-        papers_by_id = {}
-        fetched = 0
         try:
             if attempt > 0:
                 wait = 30
@@ -630,8 +723,15 @@ def _fetch_api_window(
             raise
         except arxiv.HTTPError as e:
             if e.status == 429:
-                print("  arXiv API returned HTTP 429.")
-                print("  Stopping without automatic retries to avoid additional load.")
+                wait = rate_limits.next_wait(client)
+                if wait is not None:
+                    print(
+                        f"  arXiv API rate limited; waiting {wait:.0f}s before "
+                        f"retry {rate_limits.waits}/{_RATE_LIMIT_MAX_RETRIES}..."
+                    )
+                    time.sleep(wait)
+                    continue
+                print("  arXiv API still rate limited after polite backoffs; giving up.")
                 raise
             else:
                 print(f"  arXiv API error (HTTP {e.status}): {e}")
@@ -776,6 +876,11 @@ def fetch_papers(
     client = _new_client()
     proxy_retried = False
     effective_max = min(max_results, 300)
+    rate_limits = _RateLimitBudget()
+    # Accumulate across retries: results are deduplicated by base_id, so a
+    # rate-limit retry resumes with the pages it already fetched.
+    papers_by_id = {}
+    fetched = 0
 
     submitted_search = arxiv.Search(
         query=cat_query,
@@ -800,8 +905,6 @@ def fetch_papers(
 
     attempt = 0
     while attempt < max_retries:
-        papers_by_id = {}
-        fetched = 0
         try:
             if attempt > 0:
                 wait = 30
@@ -847,8 +950,15 @@ def fetch_papers(
             raise
         except arxiv.HTTPError as e:
             if e.status == 429:
-                print("  arXiv API returned HTTP 429.")
-                print("  Stopping without automatic retries to avoid additional load.")
+                wait = rate_limits.next_wait(client)
+                if wait is not None:
+                    print(
+                        f"  arXiv API rate limited; waiting {wait:.0f}s before "
+                        f"retry {rate_limits.waits}/{_RATE_LIMIT_MAX_RETRIES}..."
+                    )
+                    time.sleep(wait)
+                    continue
+                print("  arXiv API still rate limited after polite backoffs; giving up.")
                 raise
             else:
                 print(f"  arXiv API error (HTTP {e.status}): {e}")
