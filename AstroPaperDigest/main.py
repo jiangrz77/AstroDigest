@@ -383,9 +383,12 @@ def main():
     digest_dir = output_cfg.get("digest_dir", "./output/digests")
     digest_path = write_digest(all_papers, digest_dir, threshold, digest_date=arxiv_date)
 
-    # First figures for recommended papers (4-5 stars) shown in the desktop
-    # digest card.  Best-effort: failures never block the digest itself.
-    if not args.dry_run:
+    # Gallery figures for recommended papers (4-5 stars).  Best-effort:
+    # failures never block the digest itself.  App-launched runs (staged
+    # output) defer this entirely: the digest view fetches figures in the
+    # background and the page fills them in as they land, so the pipeline no
+    # longer sits in step 5 downloading every paper's full gallery.
+    if not args.dry_run and not staging_dir:
         print("\nFetching paper figures...")
         try:
             fetch_figures_for_digest(
@@ -395,6 +398,9 @@ def main():
                 digest_date=arxiv_date,
                 min_score=FIGURE_MIN_SCORE,
                 existing_dir=live_figures_dir,
+                on_progress=lambda done, total: emit(
+                    "figures", done, total, f"Fetching figures {done}/{total} papers…"
+                ),
             )
         except Exception as exc:
             print(f"  Warning: figure fetching failed (digest saved): {exc}")

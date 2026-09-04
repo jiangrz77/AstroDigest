@@ -49,9 +49,11 @@ from src.figures import (
     MAX_FIGURES,
     MIN_SCORE as FIGURE_MIN_SCORE,
     PARSER_VERSION,
+    delete_paper_figures,
     fetch_figures_for_digest,
     figure_path,
     load_sidecar as load_figure_sidecar,
+    write_sidecar as write_figure_sidecar,
 )
 from src.notifier import load_email_state, send_digest_file, send_test_email
 from src import updater
@@ -790,6 +792,7 @@ _STAGE_LABELS = {
     "filter": "Filtering papers",
     "rank": "AI ranking",
     "output": "Generating output",
+    "figures": "Fetching figures",
     "done": "Done",
     "cancelled": "Cancelled",
     "error": "Error",
@@ -1004,6 +1007,13 @@ def run_pipeline(include_cross: bool = True, include_replacements: bool = True, 
                     _current_digest = parse_digest(digest_path)
             except Exception:
                 _current_digest = None
+            if digest_path:
+                # The fresh digest may score different papers into the 4-5
+                # star figure set than an earlier run for the same date (the
+                # pipeline defers figure fetching to this app's backfill);
+                # its first view re-evaluates backfill, and the retention
+                # sweep marks figures whose papers dropped out of the range.
+                _sweep_figure_retention()
             if digest_path and "=== Done! ===" in stdout:
                 cfg, env_values = _load_config_and_env()
                 if _email_is_configured(cfg, env_values):
@@ -3141,8 +3151,36 @@ function giveFeedback(btn, action) {
     if(d.ok){
       updateCardScore(card, d.score);
       updatePendingOrderRefresh();
+      if (typeof d.score === 'number') syncCardFigureState(card, id, d.score, d.figures);
     }
   }).catch(function () {}).finally(function () { updateFeedbackButtons(card); });
+}
+
+function syncCardFigureState(card, pid, score, action) {
+  // The rating drives the gallery: 4-5 stars show it (fetching on demand
+  // when the server reports 'pending'), 3 stars and below only hide the
+  // view — the images stay cached server-side for the retention period.
+  const figure = card.querySelector('.card-figure[data-figure-pid="' + pid + '"]');
+  if (score < 4) {
+    if (figure) { figure.remove(); layoutFigures(); }
+    return;
+  }
+  if (figure && !figure.classList.contains('card-figure-loading')) {
+    startFigurePolling();  // cached anchor; the poll refreshes its "+N" badge
+    return;
+  }
+  if (action === 'none' || action === 'hidden') return;
+  if (!figure) {
+    const title = card.querySelector('.card-title');
+    if (!title) return;
+    const holder = document.createElement('div');
+    holder.className = 'card-figure card-figure-loading';
+    holder.dataset.figurePid = pid;
+    holder.title = 'Fetching figure…';
+    title.insertAdjacentElement('afterend', holder);
+  }
+  layoutFigures();
+  startFigurePolling();
 }
 
 function refreshOrder() {
@@ -3475,13 +3513,17 @@ setTimeout(layoutFigures, 400);
   });
 })();
 </script>
-{% if figure_pending or figure_backfill_active %}
 <script>
 // Figures for this digest are being fetched or upgraded in the background
 // (new placeholders, or gallery upgrades for papers recorded at a lower
 // depth).  Poll until the run ends, swapping in thumbnails and refreshing
-// "+N" badges as figures land.
-(function () {
+// "+N" badges as figures land.  Also started on demand by rating upgrades
+// (syncCardFigureState) when a paper crosses into the 4-5 star range, so
+// the function is defined on every digest page.
+let figurePollActive = false;
+function startFigurePolling() {
+  if (figurePollActive) return;
+  figurePollActive = true;
   const digestDate = {{ digest.date | tojson }};
   let remaining = 45;  // ~3 minutes at 4s intervals
   function fillHolder(pid, entry) {
@@ -3533,6 +3575,8 @@ setTimeout(layoutFigures, 400);
     const card = document.getElementById('card-' + pid.replace(/\./g, '-'));
     const title = card && card.querySelector('.card-title');
     if (!card || !title) return;
+    // A rating downgrade removed the gallery view; keep it gone.
+    if (Number(card.dataset.score || 0) < 4) return;
     const anchor = document.createElement('a');
     anchor.className = 'card-figure';
     anchor.setAttribute('role', 'button');
@@ -3564,18 +3608,23 @@ setTimeout(layoutFigures, 400);
         Object.keys(status.figures || {}).forEach(function (pid) {
           fillHolder(pid, status.figures[pid]);
         });
-        if (!status.running || --remaining <= 0) { finish(); return; }
-        setTimeout(poll, 4000);
+        // Keep polling while the fetch runs or unfilled placeholders remain
+        // (a rating upgrade can queue work after the current run ends).
+        if ((status.running || document.querySelector('.card-figure-loading')) && --remaining > 0) {
+          setTimeout(poll, 4000);
+        } else { finish(); figurePollActive = false; }
       })
       .catch(function () {
-        if (--remaining <= 0) { finish(); return; }
+        if (--remaining <= 0) { finish(); figurePollActive = false; return; }
         setTimeout(poll, 4000);
       });
   }
   poll();
-})();
-</script>
+}
+{% if figure_pending or figure_backfill_active %}
+startFigurePolling();
 {% endif %}
+</script>
 <script>
 window.APD_DIGEST_STATUS = {{ digest_status_map() | tojson }};
 </script>
@@ -3895,7 +3944,12 @@ def _load_full_abstracts(date_str):
 # so backfilling would hammer the PDF fallback for little value.
 _FIGURE_BACKFILL_WINDOW_DAYS = 60
 _figure_backfill_lock = Lock()
-_figure_backfill_state = {"running": False, "date": "", "done": set()}
+_figure_backfill_state = {"running": False, "date": ""}
+
+# A paper downgraded out of the 4-5 star range keeps its downloaded figures
+# for this many days (a re-upgrade cancels the deletion), then the cache is
+# cleaned.  The stamps live next to the images as .figure_retention.json.
+_FIGURE_RETENTION_DAYS = 7
 
 
 def _digests_dir() -> str:
@@ -3946,17 +4000,27 @@ def _figure_backfill_needed(candidates: list[str], sidecar: dict) -> bool:
 
 
 def _start_figure_backfill(date_str: str) -> None:
-    """Fetch missing figures for an old digest in a background thread."""
+    """Fetch missing figures for a digest in a background thread.
+
+    The pass repeats (bounded) while work keeps appearing: a rating change
+    can upgrade a new paper into the 4-5 star figure set while an earlier
+    pass is still running, and every pass recomputes the target set from
+    the digest plus the day's feedback adjustments.  There is deliberately
+    no per-date "done" marker: whether work remains is re-evaluated from
+    the sidecar each time, so upgraded papers are always picked up.
+    """
     with _figure_backfill_lock:
-        if _figure_backfill_state["running"] or date_str in _figure_backfill_state["done"]:
+        if _figure_backfill_state["running"]:
             return
         _figure_backfill_state["running"] = True
         _figure_backfill_state["date"] = date_str
 
     def run():
         try:
-            digest_path = get_digest_path_for_date(date_str)
-            if digest_path:
+            for _attempt in range(3):
+                digest_path = get_digest_path_for_date(date_str)
+                if not digest_path:
+                    break
                 digest = parse_digest(digest_path)
                 # Mirror the page's scoring: apply the same day's ±star
                 # feedback adjustments so backfill targets match the cards
@@ -3966,6 +4030,9 @@ def _start_figure_backfill(date_str: str) -> None:
                 except Exception:
                     pass
                 candidates = _figure_candidates(digest)
+                sidecar = load_figure_sidecar(_digests_dir(), date_str)
+                if not candidates or not _figure_backfill_needed(candidates, sidecar):
+                    break
                 fetch_figures_for_digest(
                     [{"id": pid, "score": 5} for pid in candidates],
                     _figures_dir(),
@@ -3978,9 +4045,169 @@ def _start_figure_backfill(date_str: str) -> None:
             with _figure_backfill_lock:
                 _figure_backfill_state["running"] = False
                 _figure_backfill_state["date"] = ""
-                _figure_backfill_state["done"].add(date_str)
 
     Thread(target=run, daemon=True, name="figure-backfill").start()
+
+
+# --- Figure retention ------------------------------------------------------
+# A paper that leaves the 4-5 star range loses its gallery view, but the
+# downloaded images stay on disk for _FIGURE_RETENTION_DAYS to give a
+# re-upgrade instant figures; after that they are deleted automatically.
+
+
+def _figure_retention_path() -> str:
+    return os.path.join(_figures_dir(), ".figure_retention.json")
+
+
+def _load_figure_retention() -> dict:
+    path = _figure_retention_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_figure_retention(store: dict) -> None:
+    figures_dir = _figures_dir()
+    os.makedirs(figures_dir, exist_ok=True)
+    path = _figure_retention_path()
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def _mark_figure_retention(date_str: str, paper_id: str, below: bool) -> None:
+    """Record or clear a paper's downgraded-out-of-gallery state.
+
+    below=True stamps the first moment the paper left the 4-5 star range
+    (an existing stamp is kept, so a later re-downgrade does not reset the
+    clock); below=False cancels a pending deletion (paper re-upgraded).
+    """
+    store = _load_figure_retention()
+    if below:
+        if paper_id not in store:
+            store[paper_id] = {
+                "date": date_str,
+                "below_since": datetime.now().isoformat(timespec="seconds"),
+            }
+    elif paper_id in store:
+        store.pop(paper_id, None)
+    else:
+        return
+    _save_figure_retention(store)
+
+
+def _expire_downgraded_figures(store: dict) -> dict:
+    """Delete the images of papers downgraded longer than the grace period."""
+    cutoff = datetime.now() - timedelta(days=_FIGURE_RETENTION_DAYS)
+    for pid in list(store):
+        entry = store.get(pid) or {}
+        try:
+            below_since = datetime.fromisoformat(str(entry.get("below_since", "")))
+        except ValueError:
+            below_since = datetime.now()  # undecodable stamp: restart the clock
+        if below_since > cutoff:
+            continue
+        date_str = str(entry.get("date", ""))
+        delete_paper_figures(_figures_dir(), pid)
+        sidecar = load_figure_sidecar(_digests_dir(), date_str)
+        if pid in sidecar["papers"]:
+            sidecar["papers"].pop(pid, None)
+            write_figure_sidecar(_digests_dir(), date_str, sidecar)
+        store.pop(pid, None)
+    return store
+
+
+def _sweep_figure_retention() -> None:
+    """Re-evaluate retention marks against current ratings, then expire.
+
+    For every digest that has downloaded figures, papers whose effective
+    score (digest plus the day's feedback) left the 4-5 star range are
+    stamped with the moment they dropped; papers back at 4-5 stars are
+    unstamped.  Stamps older than the grace period then have their images
+    deleted.  The digest currently being backfilled is skipped: its sidecar
+    is being rewritten by the fetch thread.
+    """
+    try:
+        with _figure_backfill_lock:
+            active_date = (
+                _figure_backfill_state["date"]
+                if _figure_backfill_state["running"] else ""
+            )
+        store = _load_figure_retention()
+        digests_dir = _digests_dir()
+        sidecar_names = os.listdir(digests_dir) if os.path.isdir(digests_dir) else []
+        for name in sidecar_names:
+            match = re.search(r"^digest_(\d{4}-\d{2}-\d{2})\.figures\.json$", name)
+            if not match:
+                continue
+            date_str = match.group(1)
+            if date_str == active_date:
+                continue
+            sidecar = load_figure_sidecar(digests_dir, date_str)
+            if not sidecar["papers"]:
+                continue
+            digest_path = get_digest_path_for_date(date_str)
+            if not digest_path:
+                continue  # digest file gone; existing stamps still expire below
+            digest = parse_digest(digest_path)
+            try:
+                apply_to_digest(digest, date_str)
+            except Exception:
+                pass
+            effective = {
+                p.get("paper_id"): int(p.get("score") or 0)
+                for tier in digest.get("tiers", [])
+                for p in tier.get("papers", [])
+            }
+            for pid in sidecar["papers"]:
+                if pid not in effective:
+                    continue
+                if effective[pid] >= FIGURE_MIN_SCORE:
+                    store.pop(pid, None)
+                elif pid not in store:
+                    store[pid] = {
+                        "date": date_str,
+                        "below_since": datetime.now().isoformat(timespec="seconds"),
+                    }
+        _save_figure_retention(_expire_downgraded_figures(store))
+    except Exception:
+        pass  # retention is housekeeping; never disturb the caller
+
+
+def _handle_figure_rating_change(date_str: str, paper_id: str,
+                                 effective_score: int) -> str:
+    """React to a ±star change: fetch, hide, or retain a paper's figures.
+
+    Returns the client-facing state: "cached" (the anchor can render now),
+    "pending" (a fetch was started), "hidden" (the gallery view is removed;
+    images stay on disk for the retention grace period), or "none".
+    """
+    sidecar = load_figure_sidecar(_digests_dir(), date_str)
+    entry = sidecar["papers"].get(paper_id)
+    if effective_score >= FIGURE_MIN_SCORE:
+        # Back at 4-5 stars: cancel any pending retention deletion and make
+        # sure the gallery is fetched (a previously failed fetch is retried:
+        # the upgrade is an explicit user ask).
+        _mark_figure_retention(date_str, paper_id, below=False)
+        if paper_id in sidecar["failed"]:
+            sidecar["failed"].pop(paper_id, None)
+            write_figure_sidecar(_digests_dir(), date_str, sidecar)
+            sidecar = load_figure_sidecar(_digests_dir(), date_str)
+        if _figure_backfill_needed([paper_id], sidecar):
+            _start_figure_backfill(date_str)
+        return "cached" if entry and entry.get("files") else "pending"
+    if entry and entry.get("files"):
+        # Out of the 4-5 star range: the gallery view disappears, but the
+        # images stay on disk for the grace period before auto-deletion.
+        _mark_figure_retention(date_str, paper_id, below=True)
+        return "hidden"
+    return "none"
 
 
 # --- Recommendation reason keyword highlighting -----------------------------
@@ -4660,6 +4887,7 @@ def post_feedback():
             "adjustment": current_delta,
             "action": action,
             "recorded": False,
+            "figures": "none",
         })
 
     feedback.append({
@@ -4690,12 +4918,18 @@ def post_feedback():
     except Exception:
         pass  # learned profile is best-effort; never break feedback recording
 
+    # A rating change drives the figure gallery: crossing into 4-5 stars
+    # fetches figures (cached ones show immediately), dropping below hides
+    # the gallery and starts the retention grace period.
+    figures_state = _handle_figure_rating_change(date_str, paper_id, effective_score)
+
     return jsonify({
         "ok": True,
         "score": effective_score,
         "adjustment": delta,
         "action": action,
         "recorded": True,
+        "figures": figures_state,
     })
 
 
@@ -4930,6 +5164,10 @@ def main():
     digest_path = get_latest_digest_path()
     if digest_path and os.path.exists(digest_path):
         _current_digest = parse_digest(digest_path)
+
+    # Figure retention housekeeping: papers downgraded out of the 4-5 star
+    # range keep their images for a grace period, then the cache is cleaned.
+    Thread(target=_sweep_figure_retention, daemon=True, name="figure-retention").start()
 
     # Automatically check today's batch at most once, and only after the
     # arXiv publication window opens in GMT+8. Manual Regenerate remains

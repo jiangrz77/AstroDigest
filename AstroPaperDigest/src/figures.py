@@ -26,6 +26,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
 import requests
@@ -59,6 +60,12 @@ IMAGE_TIMEOUT = (10, 60)
 PDF_TIMEOUT = (10, 180)
 # arXiv asks automated clients to stay around one request per second.
 REQUEST_INTERVAL = 1.2
+# Within one paper, figure images are downloaded several at a time: they are
+# static assets behind arXiv's CDN, and serial downloads made gallery
+# completion the slowest part of figure fetching once galleries grew to a
+# paper's full figure set.  Pacing between papers is unaffected, and a 429 is
+# still retried politely per request.
+IMAGE_DOWNLOAD_WORKERS = 4
 MAX_HTML_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PDF_IMAGE_BYTES = 4 * 1024 * 1024
 # Ignore PDF images smaller than a 120x120 block: logos, separators, inline
@@ -125,6 +132,28 @@ def cached_figure_files(figures_dir: str, paper_id: str, max_figures: int = MAX_
             break
         files.append(os.path.basename(path))
     return files
+
+
+def delete_paper_figures(figures_dir: str, paper_id: str,
+                         max_figures: int = MAX_FIGURES) -> list[str]:
+    """Remove a paper's cached figure files; returns the deleted names.
+
+    Used by figure retention: a paper downgraded out of the 4-5 star range
+    keeps its gallery for a grace period, then the cache is cleaned.
+    """
+    base = sanitize_paper_id(paper_id)
+    deleted = []
+    for index in range(1, max_figures + 1):
+        for name in _figure_names(base, index):
+            path = os.path.join(figures_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+                deleted.append(name)
+            except OSError:
+                pass  # locked or already gone; the next sweep retries
+    return deleted
 
 
 def _caption_text(fragment: str) -> str:
@@ -290,13 +319,15 @@ def fetch_figure_html(paper_id: str, session: requests.Session,
     items = parse_figure_items(response.text, max_figures)
     if not items:
         return [], []
-    figures = []
-    for offset, (src, _caption) in enumerate(items):
-        if offset < skip:
-            continue
-        downloaded = _download_image(session, response.url, src)
-        if downloaded:
-            figures.append(downloaded)
+    offsets = [offset for offset in range(len(items)) if offset >= skip]
+    # pool.map keeps document order while downloading concurrently; a failed
+    # download simply drops out, exactly as the serial loop did.
+    with ThreadPoolExecutor(max_workers=IMAGE_DOWNLOAD_WORKERS) as pool:
+        downloads = list(pool.map(
+            lambda offset: _download_image(session, response.url, items[offset][0]),
+            offsets,
+        ))
+    figures = [downloaded for downloaded in downloads if downloaded]
     captions = [caption for _src, caption in items]
     return figures, captions
 
@@ -461,6 +492,7 @@ def fetch_figures_for_digest(
     existing_dir: str | None = None,
     session: requests.Session | None = None,
     max_figures: int = MAX_FIGURES,
+    on_progress=None,
 ) -> dict:
     """Fetch gallery figures for a digest's recommended (>= min_score) papers.
 
@@ -468,7 +500,9 @@ def fetch_figures_for_digest(
     are recorded incrementally in the sidecar so a cancelled run keeps its
     progress and successful papers are not fetched again.  Papers recorded
     at a lower gallery depth than ``max_figures`` are upgraded by fetching
-    only their missing figures.
+    only their missing figures.  ``on_progress(position, total)`` is called
+    (when given) once per paper that actually needs fetching, with the
+    paper's 1-based position among the digest's figure targets.
     """
     session = session or new_session()
     sidecar = load_sidecar(digest_dir, digest_date) if digest_dir else {"papers": {}, "failed": {}, "pv": PARSER_VERSION}
@@ -490,7 +524,7 @@ def fetch_figures_for_digest(
     ]
     fetched = existing = failed_count = 0
     next_allowed = 0.0
-    for paper in targets:
+    for position, paper in enumerate(targets, start=1):
         pid = _paper_key(paper)
         if pid in sidecar["failed"]:
             continue
@@ -506,6 +540,8 @@ def fetch_figures_for_digest(
         if depth >= max_figures and capv >= CAPTION_VERSION:
             continue  # already recorded at this depth and caption version
         have = cached_figure_files(figures_dir, pid, max_figures, extra_dir=existing_dir)
+        if on_progress is not None:
+            on_progress(position, len(targets))
         # Stay near one request per second to arXiv across papers.
         delay = next_allowed - time.monotonic()
         if delay > 0:
