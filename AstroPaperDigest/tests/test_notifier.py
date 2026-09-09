@@ -85,7 +85,7 @@ def test_starttls_success_sends_message():
 
     args = server.sendmail.call_args.args
     assert args[0] == "sender@example.com"
-    assert args[1] == "recipient@example.com"
+    assert args[1] == ["recipient@example.com"]
     raw = args[2]
     assert "Subject: Digest subject" in raw
     assert "From: sender@example.com" in raw
@@ -159,7 +159,7 @@ def test_env_vars_override_config():
     server.login.assert_called_once_with("env-sender@example.com", "secret")
     args = server.sendmail.call_args.args
     assert args[0] == "env-sender@example.com"
-    assert args[1] == "env-recipient@example.com"
+    assert args[1] == ["env-recipient@example.com"]
     assert "From: env-sender@example.com" in args[2]
     assert "To: env-recipient@example.com" in args[2]
     print("  PASSED (env EMAIL_SENDER/RECIPIENT/SMTP_SERVER/SMTP_PORT used)")
@@ -228,7 +228,7 @@ def test_smtp_username_override():
     server.login.assert_called_once_with("rzjiang", "secret")
     args = server.sendmail.call_args.args
     assert args[0] == "sender@example.com"
-    assert args[1] == "recipient@example.com"
+    assert args[1] == ["recipient@example.com"]
     print("  PASSED (login used SMTP_USERNAME, From/To used sender/recipient)")
 
 

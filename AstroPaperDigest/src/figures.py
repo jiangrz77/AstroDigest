@@ -52,8 +52,9 @@ CAPTION_VERSION = 1
 
 # Parser version: bumped when figure parsing gains a new capability, so
 # papers previously misrecorded as figure-less get one retry.  v2 added
-# <object>-embedded SVG figures (newer LaTeXML renderings).
-PARSER_VERSION = 2
+# <object>-embedded SVG figures; v3 distinguishes unavailable sources from
+# successfully inspected papers with no usable figures.
+PARSER_VERSION = 3
 
 PAGE_TIMEOUT = (10, 30)
 IMAGE_TIMEOUT = (10, 60)
@@ -310,24 +311,30 @@ def fetch_figure_html(paper_id: str, session: requests.Session,
     needs to re-download images.
     """
     page_url = f"https://arxiv.org/html/{paper_id}"
-    try:
-        response = _get(session, page_url, PAGE_TIMEOUT)
-    except requests.RequestException:
+    response = _get(session, page_url, PAGE_TIMEOUT)
+    if response.status_code == 404:
         return [], []
     if response.status_code != 200 or not response.text.strip().startswith("<"):
-        return [], []
+        raise requests.RequestException("HTML unavailable")
     items = parse_figure_items(response.text, max_figures)
     if not items:
         return [], []
     offsets = [offset for offset in range(len(items)) if offset >= skip]
-    # pool.map keeps document order while downloading concurrently; a failed
-    # download simply drops out, exactly as the serial loop did.
+    # pool.map keeps document order while downloading concurrently.
     with ThreadPoolExecutor(max_workers=IMAGE_DOWNLOAD_WORKERS) as pool:
         downloads = list(pool.map(
             lambda offset: _download_image(session, response.url, items[offset][0]),
             offsets,
         ))
-    figures = [downloaded for downloaded in downloads if downloaded]
+    # Keep a consecutive prefix so retries cannot skip a failed image or
+    # pair later images with the wrong captions.
+    figures = []
+    for downloaded in downloads:
+        if downloaded is None:
+            break
+        figures.append(downloaded)
+    if offsets and not figures:
+        raise requests.RequestException("Figure download failed")
     captions = [caption for _src, caption in items]
     return figures, captions
 
@@ -338,12 +345,9 @@ def fetch_figure_pdf(paper_id: str, session: requests.Session,
     if fitz is None:
         return [], []
     pdf_url = f"https://arxiv.org/pdf/{paper_id}"
-    try:
-        response = _get(session, pdf_url, PDF_TIMEOUT)
-    except requests.RequestException:
-        return [], []
+    response = _get(session, pdf_url, PDF_TIMEOUT)
     if response.status_code != 200 or not response.content[:5] == b"%PDF-":
-        return [], []
+        raise requests.RequestException("PDF unavailable")
     figures = _pdf_figures(response.content, max_figures)
     return figures[max(0, skip):], []
 
@@ -396,15 +400,23 @@ def fetch_paper_figure(paper_id: str, session: requests.Session,
     an empty figures list with a reason string ("no_figure", ...) means
     nothing was retrievable.
     """
-    figures, captions = fetch_figure_html(paper_id, session, max_figures, skip)
-    if figures or captions:
-        return {"figures": figures, "captions": captions, "source": "html"}
+    html_failed = False
+    try:
+        figures, captions = fetch_figure_html(paper_id, session, max_figures, skip)
+        if figures or captions:
+            return {"figures": figures, "captions": captions, "source": "html"}
+    except (requests.RequestException, ValueError):
+        html_failed = True
     if fitz is None:
-        return {"figures": [], "captions": [], "source": "no_html_figure"}
-    figures, _captions = fetch_figure_pdf(paper_id, session, max_figures, skip)
+        return {"figures": [], "captions": [], "source": "request_failed" if html_failed else "no_html_figure"}
+    try:
+        figures, _captions = fetch_figure_pdf(paper_id, session, max_figures, skip)
+    except Exception:
+        # An unavailable or malformed PDF is not evidence of a figure-less paper.
+        return {"figures": [], "captions": [], "source": "request_failed"}
     if figures:
         return {"figures": figures, "captions": ["" for _ in figures], "source": "pdf"}
-    return {"figures": [], "captions": [], "source": "no_figure"}
+    return {"figures": [], "captions": [], "source": "request_failed" if html_failed else "no_figure"}
 
 
 def sidecar_path(digest_dir: str, digest_date: str) -> str:
@@ -537,9 +549,10 @@ def fetch_figures_for_digest(
             except (TypeError, ValueError):
                 depth = 1
             capv = entry.get("capv") or 0
-        if depth >= max_figures and capv >= CAPTION_VERSION:
-            continue  # already recorded at this depth and caption version
         have = cached_figure_files(figures_dir, pid, max_figures, extra_dir=existing_dir)
+        if depth >= max_figures and capv >= CAPTION_VERSION and have:
+            continue  # cached files must still exist
+
         if on_progress is not None:
             on_progress(position, len(targets))
         # Stay near one request per second to arXiv across papers.
@@ -550,6 +563,9 @@ def fetch_figures_for_digest(
         # skip=len(have): cached figures are not redownloaded; captions come
         # back for the whole range so a caption refresh is page-fetch only.
         result = fetch_paper_figure(pid, session, max_figures, skip=len(have))
+        if result["source"] == "request_failed":
+            time.sleep(REQUEST_INTERVAL)
+            result = fetch_paper_figure(pid, session, max_figures, skip=len(have))
         files = list(have)
         for index, (data, ext) in enumerate(result["figures"], start=len(have) + 1):
             try:
@@ -558,7 +574,10 @@ def fetch_figures_for_digest(
                 fetched += 1
             except OSError:
                 break
+        incomplete = result["source"] == "request_failed"
         fetched_captions = [str(c or "") for c in (result.get("captions") or [])]
+        if incomplete and entry:
+            fetched_captions = entry.get("captions", [])
         captions = (fetched_captions + [""] * len(files))[: len(files)]
         if files:
             if len(files) == len(have) and have:
@@ -567,14 +586,19 @@ def fetch_figures_for_digest(
                 "source": result["source"] if result["figures"] else (entry or {}).get("source", "html"),
                 "files": files,
                 "captions": captions,
-                "depth": max_figures,
+                "depth": (min(len(files), max_figures - 1) if incomplete else
+                          max_figures if len(files) >= len(fetched_captions) else len(files)),
                 "capv": CAPTION_VERSION,
             }
         else:
-            sidecar["failed"][pid] = result["source"]
+            sidecar["papers"].pop(pid, None)
+            sidecar["failed"][pid] = result["source"] if result["source"] not in ("html", "pdf") else "write_failed"
             failed_count += 1
         if digest_dir:
             write_sidecar(digest_dir, digest_date, sidecar)
+    # Persist parser migration even when every image was already cached.
+    if digest_dir:
+        write_sidecar(digest_dir, digest_date, sidecar)
     if targets:
         print(
             f"  Figures: {fetched} fetched, {existing} cached, "

@@ -1,97 +1,31 @@
 # AstroPaperDigest
 
-[Chinese Docs](README_zh.md)
+[中文](README_zh.md)
 
-Automatically fetches, filters, and ranks daily astrophysics papers based on your research interests using LLM-powered relevance scoring. Comes with a native desktop window for browsing, date navigation, and personalized settings.
+Your daily astrophysics reading list, ranked by how closely each paper matches your research interests.
 
-![AstroPaperDigest desktop app — daily digest with recommendation reasons, paper figures, and collapsible abstracts](docs/screenshot-digest.png)
+![Daily digest with paper ratings, recommendation reasons, and figure previews](docs/screenshot-digest.png)
 
-## Features
+## What it does
 
-- **LLM ranking**: DeepSeek (or any OpenAI-compatible API) scores paper relevance 1-5 stars with a short recommendation reason
-- **Desktop UI**: Native macOS window (WebKit) with date navigation, tiered browsing, and real-time filtering
-- **Recommendation cards**: each 4-5 star paper shows its recommendation reason and first figure (fetched from arXiv HTML, with PDF fallback); abstracts stay one click away
-- **Setup wizard**: First-launch wizard for API key and research interests
-- **Zotero library**: Read a local Zotero database directly to build the research profile
-- **Dual output**: BibTeX entries + Markdown digest, organized by date
-- **Email notifications**: sends `【AstroPaper Daily】date` after each successful update, including all 5-star recommendations with full abstracts
-- **macOS app**: Double-click to run, opens a native desktop window
+- Ranks papers from arXiv with 1–5 stars and a short recommendation reason.
+- Shows figure previews and galleries for 4–5 star papers in a macOS desktop app.
+- Uses your keywords or local Zotero library to personalize recommendations, with optional daily email.
 
-## Email notifications
+## Get started
 
-Enable email in **Settings → Email Notification** and provide your SMTP settings. After a successful daily digest update, AstroPaperDigest sends one email for that date. The message includes every 5-star paper with its title, score, reason, authors, categories, arXiv link, and full abstract; lower-rated papers remain available in the App. A message is still sent when there are no 5-star papers.
+1. Download the latest **DMG** from [Releases](https://github.com/jiangrz77/AstroPaperDigest/releases/latest) and drag the app into **Applications**.
+2. Open the app and set up your API key and research interests.
+3. Browse your daily digest; use Settings to adjust your profile or enable email.
 
-Daily sends are deduplicated by date. Use **Resend Latest Digest** in Settings or run `send_digests.py --resend YYYY-MM-DD` for an explicit resend. Messages include both HTML and plain-text parts and threading headers to help mailbox clients display the updates as one series. The App link uses the `astropaperdigest://` macOS URL scheme so it can launch the App and open the requested date when the App is not already running.
+Requires macOS and a DeepSeek or other OpenAI-compatible API key. The DMG includes Python.
 
-## Quick Start
+If macOS blocks the first launch, use **System Settings → Privacy & Security → Open Anyway**.
 
-### Option A: dmg installer (no Python required)
+## More
 
-1. Download **`AstroPaperDigest-<version>.dmg`** from GitHub Releases
-2. Double-click it and drag **AstroPaperDigest.app** into **Applications**
-3. Launch it — a native desktop window with the setup wizard opens
-
-> First launch of a downloaded app may ask for confirmation once (right-click → **Open**, or **System Settings → Privacy & Security → Open Anyway**). Only needed once.
-
-### Option B: source / Install.command (requires Python 3.9+)
-
-> **Note:** Do not run from `~/Downloads/` — macOS blocks downloaded files. Move the project to a permanent location first (e.g., `~/Projects/`).
-
-1. Double-click **`Install.command`** — sets up Python environment and builds the app
-2. Double-click **`AstroPaperDigest.app`** — a native desktop window opens automatically
-
-## Zotero research profile
-
-In **Settings → Research Profile**, select **Use Zotero Library**. The app first tries the default database location:
-
-```text
-~/Zotero/zotero.sqlite
-```
-
-When you save the profile setting, AstroPaperDigest immediately reads a private copy in read-only mode and validates the library. If the default location cannot be read, the Settings page explains the error and asks for the real `zotero.sqlite` path. For custom data locations, check Zotero **Settings → Advanced → Files and Folders**.
-
-After a custom path succeeds, it is saved for later runs. The same setting can be written directly in `config.yaml`:
-
-```yaml
-profile_source: zotero
-zotero_db: ~/Zotero/zotero.sqlite
-```
-
-Missing, unreadable, invalid, or incompatible databases are reported explicitly; the app does not silently switch to a keyword or BibTeX profile.
-
-## Auto Update
-
-- **When checked**: once in the background at app startup (silent on network failure), plus a manual "Check for Updates" button on the **Settings (⛭) → General → Update** page.
-- **Notification**: a blue banner appears at the top of the Digest page when a new version is found; the Settings page shows current/latest version and release notes in the Update panel.
-- **Install flow** (semi-automatic): click "Download Update" on the Settings page → SHA-256 verification after download → click "Install & Restart" → old code is backed up, sources replaced, the .app is rebuilt, and the app relaunches.
-- **Update source**: GitHub Releases (public repo). Check endpoint: `https://api.github.com/repos/jiangrz77/AstroPaperDigest/releases/latest`.
-- **Version**: single source of truth in `version.txt` (read by `build_app.sh` when building the .app).
-- **Preserved files**: updates never touch `.env`, `config.yaml`, `preferences.json`, `feedback.json`, `data/`, `output/`, `.venv`; old code is backed up to `backups/`.
-
-## Releasing a New Version (maintainers)
-
-1. Bump `version.txt` (e.g. `1.0.3`), commit and push:
-   ```bash
-   git add . && git commit -m "v1.0.3" && git push origin main
-   git tag v1.0.3 && git push origin v1.0.3
-   ```
-2. Run `./release.sh` — builds the self-contained app, then generates three artifacts under `dist/` (with SHA-256): `AstroPaperDigest-v1.0.3.source.zip` (source channel), `AstroPaperDigest-v1.0.3.app.zip` (update package), `AstroPaperDigest-1.0.3.dmg` (installer), plus `version.json`.
-3. On GitHub: **Releases → Draft a new release** → pick tag `v1.0.3` → write release notes → upload all three artifacts → **Publish release** (do NOT mark it Pre-release). Alternatively push the tag and let the GitHub Actions workflow build and attach everything automatically.
-4. dmg users install the new version from the dmg; existing app users see the banner and update in one click after launching.
-
-> If the repo is private: GitHub Releases cannot be accessed anonymously. Upload the `version.json` + `*.app.zip` from `release.sh` to any static host and point `update.github_repo` in `config.yaml` at it (or switch to a self-hosted static JSON update source).
-
-## Requirements
-
-- macOS (Apple Silicon or Intel)
-- dmg installer: **no Python needed** (self-contained)
-- Install.command channel: Python 3.9+ (pre-installed on most Macs via Xcode Command Line Tools)
-- DeepSeek API key (or any OpenAI-compatible provider)
-
-## Acknowledgment
+[User guide](docs/usage.md) · [Source installation](docs/usage.md#installation) · [Maintainer guide](docs/maintaining.md)
 
 Thank you to arXiv for use of its open access interoperability.
 
-## License
-
-MIT
+[MIT License](AstroPaperDigest/LICENSE)

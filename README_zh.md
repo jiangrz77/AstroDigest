@@ -2,98 +2,30 @@
 
 [English](README.md)
 
-基于 LLM 智能评分，自动抓取、过滤、排序每日天体物理论文，精准匹配你的研究方向。提供原生桌面窗口浏览、日期导航、个性化设置等功能。
+每天整理 arXiv 天体物理论文，按与你研究兴趣的相关程度排序。
 
-![AstroPaperDigest 桌面应用 —— 每日摘要：推荐原因、论文原图与折叠摘要](docs/screenshot-digest.png)
+![每日 Digest：论文评分、推荐理由与配图预览](docs/screenshot-digest.png)
 
-## 功能特性
+## 核心功能
 
-- **LLM 排序**：使用 DeepSeek（或任意 OpenAI 兼容 API）对论文相关性按 1–5 星评分，并给出简短推荐原因
-- **桌面界面**：原生 macOS 窗口（WebKit），支持日期导航、分层浏览、实时过滤
-- **推荐卡片**：4–5 星论文卡片突出展示推荐原因与论文首图（优先取自 arXiv HTML 版，PDF 兜底），摘要折叠为一键展开
-- **设置向导**：首次启动引导配置 API 密钥和研究兴趣
-- **Zotero 文献库**：可直接读取本机 Zotero 数据库构建研究兴趣画像
-- **双格式输出**：BibTeX 条目 + Markdown 摘要，按日期归档
-- **邮件通知**：每日更新后发送 `【AstroPaper Daily】日期` 邮件，包含全部 5 星推荐及完整摘要；完整日报仍在 App 中查看
-- **macOS 应用**：双击即可运行，打开原生桌面窗口
+- 用 1–5 星评价论文相关性，并给出简短推荐理由。
+- 在 macOS 桌面应用中浏览日报，预览 4–5 星论文配图并打开图库。
+- 根据关键词或本机 Zotero 文献库生成个性化推荐，可选每日邮件通知。
 
-## 邮件通知
+## 开始使用
 
-在 **Settings → Email Notification** 中启用邮件通知并填写 SMTP 配置。邮件会在每日摘要成功更新后发送：
+1. 从 [Releases](https://github.com/jiangrz77/AstroPaperDigest/releases/latest) 下载最新 **DMG**，将应用拖入 **Applications**。
+2. 打开应用，配置 API 密钥和研究兴趣。
+3. 浏览每日 Digest；在设置中调整兴趣画像或启用邮件通知。
 
-- 即使当天没有 5 星论文，也会发送一封日报邮件；
-- 邮件包含所有 5 星论文的标题、评分、推荐理由、作者、分类、arXiv 链接和完整摘要；
-- 4 星及以下论文的详细内容请在 AstroPaperDigest App 中查看；
-- 同一日期默认只发送一次，Settings 中可手动重发最近日报，命令行也可使用 `send_digests.py --resend YYYY-MM-DD`；
-- 邮件同时包含 HTML 和纯文本版本，并通过邮件线程头信息尽量让每日更新集中显示在同一组会话中；
-- 邮件中的 App 链接在 App 未运行时会通过 `astropaperdigest://` 启动 App，并打开对应日期。
+需要 macOS 和 DeepSeek 或其他 OpenAI 兼容服务的 API 密钥。DMG 已内置 Python。
 
-建议使用邮箱服务商提供的 **App Password**，不要填写主账号密码。密码只保存在本机 App 支持目录中，不会在设置页回显。
+首次启动如被 macOS 拦截，请前往 **系统设置 → 隐私与安全性 → 仍要打开**。
 
-## 快速开始
+## 更多
 
-> **注意：** 请勿在 `~/Downloads/` 下运行——macOS 会阻止下载的文件。请先将项目移动到固定位置（如 `~/Projects/`）。
+[使用指南与源码安装](docs/usage_zh.md) · [维护者指南](docs/maintaining.md)
 
-## 使用 Zotero 文献库
+感谢 arXiv 提供开放获取与互操作服务。
 
-在 **Settings → Research Profile** 中选择 **Use Zotero Library**。应用默认尝试读取：
-
-```text
-~/Zotero/zotero.sqlite
-```
-
-保存 Research Profile 设置后，应用会立即验证并读取文献库。应用会先复制数据库，再以只读方式读取，因此 Zotero 正在运行时通常也可以使用。
-
-如果默认位置读取失败，设置页会显示错误原因，并提示输入真实的 `zotero.sqlite` 路径。自定义数据目录可以在 Zotero 的 **Settings → Advanced → Files and Folders** 中查看。成功读取自定义路径后，应用会保存该路径供后续运行使用。
-
-配置文件也可以直接指定：
-
-```yaml
-profile_source: zotero
-zotero_db: ~/Zotero/zotero.sqlite
-```
-
-如果数据库不存在、没有权限、不是有效的 Zotero 数据库或结构不兼容，应用会报告错误，不会静默切换到关键词或 BibTeX profile。
-
-### 安装步骤
-
-1. 双击 **`Install.command`** —— 自动配置 Python 环境并构建应用
-2. 双击 **`AstroPaperDigest.app`** —— 原生桌面窗口自动打开
-
-> **macOS 安全提示？** 前往 **系统设置 → 隐私与安全性**，点击 **"仍要打开"**。仅需操作一次。
-
-## 更新机制
-
-- **检查时机**：应用启动时自动在后台检查一次（网络失败静默），也可在 **设置页（⛭）→ General → Update** 手动点击「Check for Updates」。
-- **推送提示**：发现新版本时，Digest 页顶部显示蓝色横幅；设置页的 Update 分组显示当前/最新版本与更新日志。
-- **安装流程**（半自动）：在设置页点击「Download Update」→ 下载完成后自动做 SHA-256 校验 → 点击「Install & Restart」→ 自动备份旧代码、替换源码、重建 .app 并重新打开。
-- **更新源**：GitHub Releases（公开仓库）。检查接口：`https://api.github.com/repos/jiangrz77/AstroPaperDigest/releases/latest`。
-- **版本号**：单一版本源 `version.txt`（构建 .app 时由 `build_app.sh` 读取）。
-- **保留文件**：更新不会覆盖 `.env`、`config.yaml`、`preferences.json`、`feedback.json`、`data/`、`output/`、`.venv`；旧代码自动备份到 `backups/`。
-
-## 发布新版本（开发者）
-
-1. 修改 `version.txt`（如 `1.0.3`），提交并推送：
-   ```bash
-   git add . && git commit -m "v1.0.3" && git push origin main
-   git tag v1.0.3 && git push origin v1.0.3
-   ```
-2. 运行 `./release.sh` —— 自动生成 `AstroPaperDigest-v1.0.3.zip` 与 `version.json`（含 SHA-256）。
-3. GitHub 网页：仓库 → **Releases → Draft a new release** → 选择标签 `v1.0.3` → 写更新日志 → 上传 zip 附件 → **Publish release**（不要勾选 Pre-release）。
-4. 用户端启动 App 或点「检查更新」即可收到新版本提示并一键更新。
-
-> 若仓库为私有：GitHub Releases 无法匿名访问。可将 `release.sh` 生成的 `version.json` + zip 上传到任意静态托管，并把 `config.yaml` 中 `update.github_repo` 改为对应地址（或直接使用自建静态 JSON 更新源）。
-
-## 环境要求
-
-- macOS（Apple Silicon 或 Intel）
-- Python 3.9+（大多数 Mac 通过 Xcode Command Line Tools 已预装）
-- DeepSeek API key（或任意 OpenAI 兼容服务商）
-
-## 致谢
-
-Thank you to arXiv for use of its open access interoperability.
-
-## 许可证
-
-MIT
+[MIT 许可证](AstroPaperDigest/LICENSE)

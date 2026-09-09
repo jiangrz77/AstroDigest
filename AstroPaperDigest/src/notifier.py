@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 from . import paths as _paths
 from .email_math import render_math_html
+from .email_addresses import parse_recipients, parse_sender
 
 
 APP_SCHEME = "astropaperdigest"
@@ -155,7 +156,6 @@ def send_email(
     sender = _env_or_config("EMAIL_SENDER", email_config, "sender")
     recipient = _env_or_config("EMAIL_RECIPIENT", email_config, "recipient")
     smtp_server = _env_or_config("SMTP_SERVER", email_config, "smtp_server", "smtp.gmail.com")
-    login_user = os.environ.get("SMTP_USERNAME") or email_config.get("username") or sender
     password_env = email_config.get("password_env", "EMAIL_APP_PASSWORD")
     password = os.environ.get(password_env)
 
@@ -163,6 +163,16 @@ def send_email(
         print(f"  Email config incomplete. Need sender, recipient, and {password_env} env var.")
         return False
 
+    try:
+        sender = parse_sender(sender)
+        recipients = parse_recipients(recipient)
+        if not recipients:
+            raise ValueError("At least one recipient is required.")
+    except ValueError as exc:
+        print(f"  Invalid email configuration: {exc}")
+        return False
+
+    login_user = os.environ.get("SMTP_USERNAME") or email_config.get("username") or sender
     use_ssl = _parse_bool(
         os.environ.get("SMTP_USE_SSL"),
         _parse_bool(email_config.get("use_ssl"), True),
@@ -176,7 +186,7 @@ def send_email(
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
     message["From"] = sender
-    message["To"] = recipient
+    message["To"] = ", ".join(recipients)
     for key, value in (headers or {}).items():
         if value:
             message[key] = str(value)
@@ -194,12 +204,12 @@ def send_email(
                 context=tls_context,
             ) as server:
                 server.login(login_user, password)
-                server.sendmail(sender, recipient, message.as_string())
+                server.sendmail(sender, recipients, message.as_string())
         else:
             with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
                 server.starttls(context=tls_context)
                 server.login(login_user, password)
-                server.sendmail(sender, recipient, message.as_string())
+                server.sendmail(sender, recipients, message.as_string())
         print(f"  Email sent to {recipient}")
         return True
     except Exception as exc:
@@ -313,15 +323,19 @@ def _html_body(date_str: str, papers: list[dict], links: dict) -> str:
         "style='display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;"
         "border-radius:7px;text-decoration:none'>Open AstroPaperDigest</a></p>"
     )
+    # Mail clients vary in how much of <body>'s padding they honour, so the
+    # page margin lives on a wrapper div instead; it also caps the line length
+    # of the header block and cards on wide windows.
     rich = (
-        "<!doctype html><html><body style='font-family:-apple-system,BlinkMacSystemFont,"
+        "<!doctype html><html><head><meta charset='utf-8'></head><body style='font-family:-apple-system,BlinkMacSystemFont,"
         "Segoe UI,Arial,sans-serif;color:#334155;font-size:15px;line-height:1.7;"
         "margin:0;background:#ffffff'>"
-        "<h2 style='color:#1f2937'>AstroPaperDigest Daily Digest</h2>"
-        f"<p><b>Date:</b> {html.escape(date_str)}<br>"
+        "<div style='max-width:680px;padding:24px 32px;margin:0 auto;box-sizing:border-box'>"
+        "<h2 style='color:#1f2937;margin:0 0 8px'>AstroPaperDigest Daily Digest</h2>"
+        f"<p style='margin:0 0 4px'><b>Date:</b> {html.escape(date_str)}<br>"
         f"<b>Papers today:</b> {len(papers)}<br>"
         f"<b>5-star recommendations:</b> {len(stars)}</p>"
-        + "".join(cards) + button + "</body></html>"
+        + "".join(cards) + button + "</div></body></html>"
     )
     return rich
 
@@ -428,8 +442,13 @@ def send_test_email(email_config: dict) -> bool:
         "After the next successful daily digest update, emails will be sent according to your settings."
     )
     rich = (
+        "<!doctype html><html><head><meta charset='utf-8'></head>"
+        "<body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;"
+        "color:#334155;font-size:15px;line-height:1.7;margin:0'>"
+        "<div style='max-width:680px;padding:24px 32px;margin:0 auto;box-sizing:border-box'>"
         "<p><b>AstroPaperDigest email configuration test succeeded.</b></p>"
         f"<p>Test time: {html.escape(now)}</p>"
+        "</div></body></html>"
     )
     return send_email("AstroPaperDigest Email Configuration Test", body, email_config, html_body=rich)
 

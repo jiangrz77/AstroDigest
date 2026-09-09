@@ -325,7 +325,7 @@ class FetchFiguresForDigestTests(unittest.TestCase):
             fetch2.assert_not_called()
             self.assertIn("retryme", sidecar["papers"])
             self.assertNotIn("retryme", sidecar["failed"])
-            self.assertEqual(sidecar["pv"], 2)
+            self.assertEqual(sidecar["pv"], figures.PARSER_VERSION)
 
     def test_cached_figure_refreshes_captions_without_downloads(self):
         with tempfile.TemporaryDirectory() as tmp:

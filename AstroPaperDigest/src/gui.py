@@ -55,6 +55,7 @@ from src.figures import (
     load_sidecar as load_figure_sidecar,
     write_sidecar as write_figure_sidecar,
 )
+from src.email_addresses import parse_recipients, parse_sender
 from src.notifier import load_email_state, send_digest_file, send_test_email
 from src import updater
 from src.preference_learning import (
@@ -351,12 +352,20 @@ def _save_display_categories(categories) -> list:
 def _apply_email(config: dict, env_values: dict, enable_email: bool,
                  email_address: str, smtp_server: str,
                  smtp_protocol: str, smtp_port_value: str,
-                 email_password: str) -> None:
+                 email_password: str, email_recipients=None) -> None:
     """Update email config + credentials; never wipe stored values when off."""
     smtp_port = 465 if smtp_protocol == "ssl" else 587
     if enable_email:
-        if not email_address:
-            abort(400, "Send/receive email is required when email notification is enabled.")
+        try:
+            email_address = parse_sender(email_address)
+            # Older clients omit the new field: retain an existing recipient list.
+            recipient_value = email_recipients
+            if recipient_value is None:
+                recipient_value = env_values.get("EMAIL_RECIPIENT") or config.get("email", {}).get("recipient", "")
+            recipients = parse_recipients(recipient_value or email_address)
+            recipient_text = ", ".join(recipients or [email_address])
+        except ValueError as exc:
+            abort(400, str(exc))
         if not smtp_server:
             abort(400, "SMTP server is required when email notification is enabled.")
         try:
@@ -374,7 +383,7 @@ def _apply_email(config: dict, env_values: dict, enable_email: bool,
         if not env_values.get("EMAIL_APP_PASSWORD"):
             abort(400, "Email app password is required the first time email is enabled.")
         env_values["EMAIL_SENDER"] = email_address
-        env_values["EMAIL_RECIPIENT"] = email_address
+        env_values["EMAIL_RECIPIENT"] = recipient_text
         env_values["SMTP_SERVER"] = smtp_server
         env_values["SMTP_PORT"] = str(smtp_port)
 
@@ -382,7 +391,7 @@ def _apply_email(config: dict, env_values: dict, enable_email: bool,
     if enable_email and email_address and smtp_server:
         email_cfg["enabled"] = True
         email_cfg["sender"] = email_address
-        email_cfg["recipient"] = email_address
+        email_cfg["recipient"] = recipient_text
         email_cfg["smtp_server"] = smtp_server
         email_cfg["use_ssl"] = (smtp_protocol == "ssl")
         email_cfg["smtp_port"] = smtp_port
@@ -396,6 +405,9 @@ def _setup_context() -> dict:
     cfg, env_vars = _load_config_and_env()
     profile_source = _configured_profile_source(cfg)
     email_cfg = cfg.get("email", {})
+    recipients = env_vars.get("EMAIL_RECIPIENT") or email_cfg.get("recipient", "")
+    if isinstance(recipients, list):
+        recipients = ", ".join(recipients)
     llm_cfg = cfg.get("llm", {})
     api_key_env = llm_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
     provider = {"DEEPSEEK_API_KEY": "deepseek", "OPENAI_API_KEY": "openai"}.get(api_key_env, "custom")
@@ -416,8 +428,8 @@ def _setup_context() -> dict:
         "cur_zotero_db": cfg.get("zotero_db", str(DEFAULT_ZOTERO_DB)),
         "zotero_feedback": None,
         "cur_email_sender": email_cfg.get("sender", ""),
-        "cur_email_recipient": email_cfg.get("recipient", ""),
-        "cur_email_address": email_cfg.get("sender", "") or email_cfg.get("recipient", ""),
+        "cur_email_recipient": recipients,
+        "cur_email_address": env_vars.get("EMAIL_SENDER") or email_cfg.get("sender", ""),
         "cur_smtp_server": email_cfg.get("smtp_server", ""),
         "cur_smtp_port": str(email_cfg.get("smtp_port", "465")),
         "cur_use_ssl": email_cfg.get("use_ssl", True),
@@ -1422,9 +1434,12 @@ textarea{height:80px;resize:vertical}
     </label>
     <p class="hint">After each successful daily update, receive the 5-star recommendations and their full abstracts by email.</p>
     <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
-      <label for="email_address">Send/Receive Email</label>
+      <label for="email_address">Sender Email</label>
       <input type="text" id="email_address" name="email_address" placeholder="you@example.com" value="{{ cur_email_address or '' }}">
-      <p class="hint">This address is used for both sending and receiving the daily digest.</p>
+      <p class="hint">The mailbox used to sign in to your SMTP server.</p>
+      <label for="email_recipients">Recipients</label>
+      <input type="text" id="email_recipients" name="email_recipients" placeholder="you@example.com, colleague@example.com" value="{{ cur_email_recipient or '' }}">
+      <p class="hint">Separate addresses with commas, semicolons, or spaces. Leave blank to send to yourself.</p>
       <label for="smtp_server">SMTP Server</label>
       <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
       <label for="smtp_protocol">Protocol</label>
@@ -1725,9 +1740,12 @@ textarea{height:90px;resize:vertical}
           Enable email notification
         </label>
         <div id="email-fields" {% if not cur_email_enabled %}style="display:none"{% endif %}>
-          <label for="email_address">Send/Receive Email</label>
+          <label for="email_address">Sender Email</label>
           <input type="text" id="email_address" name="email_address" placeholder="you@example.com" value="{{ cur_email_address or '' }}">
-          <p class="hint">This address is used for both sending and receiving the daily digest.</p>
+          <p class="hint">The mailbox used to sign in to your SMTP server.</p>
+          <label for="email_recipients">Recipients</label>
+          <input type="text" id="email_recipients" name="email_recipients" placeholder="you@example.com, colleague@example.com" value="{{ cur_email_recipient or '' }}">
+          <p class="hint">Separate addresses with commas, semicolons, or spaces. Leave blank to send to yourself.</p>
           <label for="smtp_server">SMTP Server</label>
           <input type="text" id="smtp_server" name="smtp_server" placeholder="smtp.gmail.com" value="{{ cur_smtp_server or '' }}">
           <label for="smtp_protocol">Protocol</label>
@@ -1755,6 +1773,8 @@ textarea{height:90px;resize:vertical}
         <button class="btn btn-primary" type="submit">Save Changes</button>
       </div>
     </form>
+    <!-- Learned weights save independently through their own API. -->
+    <form id="learned-profile-form" onsubmit="return false"></form>
   </main>
 </div>
 <script>
@@ -1876,6 +1896,7 @@ if (resendEmailButton) resendEmailButton.addEventListener('click', function () {
     if (!form) return '';
     const values = [];
     form.querySelectorAll('input, select, textarea').forEach(function (field) {
+      if (field.form !== form) return;
       if (field.type === 'file') {
         values.push([field.name, Array.from(field.files || []).map(function (file) { return file.name; })]);
       } else if (field.type === 'checkbox' || field.type === 'radio') {
@@ -1937,17 +1958,17 @@ if (resendEmailButton) resendEmailButton.addEventListener('click', function () {
       : '<span class="lp-badge lp-auto">auto</span>';
     const srcHtml = source ? '<span class="lp-source">Source: ' + esc(source) + '</span>' : '';
     const secondary = manual
-      ? '<button class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore auto</button>'
-      : '<button class="lp-btn danger" data-op="ignore" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Ignore</button>';
+      ? '<button type="button" class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore auto</button>'
+      : '<button type="button" class="lp-btn danger" data-op="ignore" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Ignore</button>';
     return '<tr>' +
       '<td>' + esc(term) + badge + srcHtml + '</td>' +
-      '<td><input type="number" step="0.05" min="0.4" max="2.5" value="' + w + '" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '"></td>' +
-      '<td><button class="lp-btn" data-op="set" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Save</button>' + secondary + '</td>' +
+      '<td><input type="number" form="learned-profile-form" step="any" min="0.4" max="2.5" value="' + w + '" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '"></td>' +
+      '<td><button type="button" class="lp-btn" data-op="set" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Save</button>' + secondary + '</td>' +
       '</tr>';
   }
   function ignoredRowHtml(kind, term) {
     return '<tr><td>' + esc(term) + ' <span class="lp-badge lp-ignored">ignored</span><span class="lp-source">no longer affects scoring</span></td>' +
-      '<td><button class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore</button></td></tr>';
+      '<td><button type="button" class="lp-btn" data-op="revert" data-kind="' + esc(kind) + '" data-term="' + esc(term) + '">Restore</button></td></tr>';
   }
   function render(profile) {
     if (!profile) { content.textContent = 'No learned preferences yet.'; return; }
@@ -2463,6 +2484,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .reason-high .reason-label,.reason-high .reason-text b{color:#1e7e34}
 .reason-text b{font-weight:600;color:#8a4b08}
 .card-figure{position:relative;float:right;display:block;width:180px;height:135px;margin:2px 0 0 16px;border:1px solid #e3e8ef;border-radius:8px;overflow:hidden;background:#f8fafc;cursor:zoom-in}
+.card-figure-state{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px;color:#64748b;font-size:12px;text-align:center;cursor:default}
+.card-figure-state button{border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;padding:5px 12px;cursor:pointer;font:inherit}
+.card-figure-state button:focus-visible{outline:2px solid #2563eb;outline-offset:3px}
+@media(prefers-reduced-motion:reduce){.card-figure-loading{animation:none!important}}
 .card-figure img{display:block;width:100%;height:100%;object-fit:contain}
 .figure-badge{position:absolute;right:6px;bottom:6px;background:rgba(15,23,42,.72);color:#fff;font-size:11px;font-weight:600;padding:2px 7px;border-radius:10px}
 .card-figure-loading{height:135px;background:linear-gradient(100deg,#f1f5f9 40%,#e2e8f0 50%,#f1f5f9 60%);background-size:200% 100%;animation:figure-shimmer 1.4s linear infinite}
@@ -2661,7 +2686,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         {% if fig.files | length > 1 %}<span class="figure-badge">+{{ fig.files | length - 1 }}</span>{% endif %}
       </a>
       {% elif paper.paper_id in figure_pending %}
-      <div class="card-figure card-figure-loading" data-figure-pid="{{ paper.paper_id }}" title="Fetching figure…"></div>
+      <div class="card-figure card-figure-state card-figure-loading" data-figure-pid="{{ paper.paper_id }}" role="status">Loading figures…</div>
+      {% else %}
+      <div class="card-figure card-figure-state" data-figure-pid="{{ paper.paper_id }}" role="status">
+        <span>{{ 'No usable figures' if figure_failures.get(paper.paper_id) == 'no_figure' else 'Could not load figures' }}</span>
+        {% if figure_failures.get(paper.paper_id) != 'no_figure' %}<button type="button" data-figure-retry>Retry</button>{% endif %}
+      </div>
       {% endif %}
     {% endif %}
     {% if paper.reason and not paper.scoring_failed %}{% set reason_kind = 'strong' if paper.score|int == 5 else ('high' if paper.score|int == 4 else 'medium') %}<div class="card-reason reason-{{ reason_kind }}" data-role="reason" {% if paper.score|int < 4 %}hidden{% endif %}><span class="reason-label">Match</span><span class="reason-text">{{ reason_html.get(paper.paper_id, '') | safe }}</span></div>{% endif %}
@@ -3174,7 +3204,8 @@ function syncCardFigureState(card, pid, score, action) {
     const title = card.querySelector('.card-title');
     if (!title) return;
     const holder = document.createElement('div');
-    holder.className = 'card-figure card-figure-loading';
+    holder.className = 'card-figure card-figure-state card-figure-loading';
+    holder.textContent = 'Loading figures…';
     holder.dataset.figurePid = pid;
     holder.title = 'Fetching figure…';
     title.insertAdjacentElement('afterend', holder);
@@ -3521,106 +3552,117 @@ setTimeout(layoutFigures, 400);
 // (syncCardFigureState) when a paper crosses into the 4-5 star range, so
 // the function is defined on every digest page.
 let figurePollActive = false;
-function startFigurePolling() {
-  if (figurePollActive) return;
-  figurePollActive = true;
-  const digestDate = {{ digest.date | tojson }};
-  let remaining = 45;  // ~3 minutes at 4s intervals
-  function fillHolder(pid, entry) {
-    const files = (entry && entry.files) || [];
-    const count = files.length || 1;
-    // Upgrade pass: the thumbnail already exists, refresh its gallery count.
-    const known = document.querySelector('.card-figure[data-figure-pid="' + pid + '"]:not(.card-figure-loading)');
-    if (known) {
-      known.dataset.figureCount = String(count);
-      known.dataset.captions = JSON.stringify((entry && entry.captions) || []);
-      let badge = known.querySelector('.figure-badge');
-      if (count > 1) {
-        if (!badge) {
-          badge = document.createElement('span');
-          badge.className = 'figure-badge';
-          known.appendChild(badge);
-        }
-        badge.textContent = '+' + (count - 1);
-      } else if (badge) {
-        badge.remove();
-      }
-      return;
-    }
-    const holder = document.querySelector('.card-figure-loading[data-figure-pid="' + pid + '"]');
-    if (holder) {
-      const anchor = document.createElement('a');
-      anchor.className = 'card-figure';
-      anchor.setAttribute('role', 'button');
-      anchor.title = 'View figures';
-      anchor.dataset.figurePid = pid;
-      anchor.dataset.figureCount = String(count);
-      anchor.dataset.captions = JSON.stringify((entry && entry.captions) || []);
-      const img = document.createElement('img');
-      img.src = '/figure/' + encodeURIComponent(pid);
-      img.alt = 'First figure';
-      img.addEventListener('load', layoutFigures);
-      anchor.appendChild(img);
-      if (count > 1) {
-        const badge = document.createElement('span');
-        badge.className = 'figure-badge';
-        badge.textContent = '+' + (count - 1);
-        anchor.appendChild(badge);
-      }
-      holder.replaceWith(anchor);
-      return;
-    }
-    // Recovered after a parser-upgrade retry: the card never had a figure
-    // element, so build one and slide it in below the title.
-    const card = document.getElementById('card-' + pid.replace(/\./g, '-'));
-    const title = card && card.querySelector('.card-title');
-    if (!card || !title) return;
-    // A rating downgrade removed the gallery view; keep it gone.
-    if (Number(card.dataset.score || 0) < 4) return;
-    const anchor = document.createElement('a');
+const figureDigestDate = {{ digest.date | tojson }};
+function showFigureState(pid, state) {
+  const card = document.getElementById('card-' + pid.replace(/\./g, '-'));
+  if (!card || Number(card.dataset.score || 0) < 4) return;
+  const old = card.querySelector('.card-figure');
+  const holder = document.createElement('div');
+  holder.className = 'card-figure card-figure-state' + (state === 'pending' ? ' card-figure-loading' : '');
+  holder.dataset.figurePid = pid;
+  holder.setAttribute('role', 'status');
+  const label = document.createElement('span');
+  label.textContent = state === 'pending' ? 'Loading figures…' : state === 'unavailable' ? 'No usable figures' : 'Could not load figures';
+  holder.appendChild(label);
+  if (state === 'failed') {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.dataset.figureRetry = '';
+    retry.textContent = 'Retry';
+    holder.appendChild(retry);
+  }
+  if (old) old.replaceWith(holder);
+  else card.querySelector('.card-title').insertAdjacentElement('afterend', holder);
+  layoutFigures();
+}
+function fillFigure(pid, entry) {
+  const files = (entry && entry.files) || [];
+  if (!files.length) return;
+  const card = document.getElementById('card-' + pid.replace(/\./g, '-'));
+  if (!card || Number(card.dataset.score || 0) < 4) return;
+  let anchor = card.querySelector('.card-figure[data-figure-count]');
+  if (!anchor) {
+    anchor = document.createElement('a');
     anchor.className = 'card-figure';
     anchor.setAttribute('role', 'button');
     anchor.tabIndex = 0;
     anchor.title = 'View figures';
     anchor.dataset.figurePid = pid;
-    anchor.dataset.figureCount = String(count);
-    anchor.dataset.captions = JSON.stringify((entry && entry.captions) || []);
     const img = document.createElement('img');
-    img.src = '/figure/' + encodeURIComponent(pid);
     img.alt = 'First figure';
     img.addEventListener('load', layoutFigures);
     anchor.appendChild(img);
-    if (count > 1) {
-      const badge = document.createElement('span');
-      badge.className = 'figure-badge';
-      badge.textContent = '+' + (count - 1);
-      anchor.appendChild(badge);
-    }
-    title.insertAdjacentElement('afterend', anchor);
+    const old = card.querySelector('.card-figure');
+    if (old) old.replaceWith(anchor);
+    else card.querySelector('.card-title').insertAdjacentElement('afterend', anchor);
+    img.src = '/figure/' + encodeURIComponent(pid);
   }
-  function finish() {
-    document.querySelectorAll('.card-figure-loading').forEach(function (holder) { holder.remove(); });
+  anchor.dataset.figureCount = String(files.length);
+  anchor.dataset.captions = JSON.stringify(entry.captions || []);
+  let badge = anchor.querySelector('.figure-badge');
+  if (files.length > 1) {
+    if (!badge) { badge = document.createElement('span'); badge.className = 'figure-badge'; anchor.appendChild(badge); }
+    badge.textContent = '+' + (files.length - 1);
+  } else if (badge) badge.remove();
+}
+function startFigurePolling() {
+  if (figurePollActive) return;
+  figurePollActive = true;
+  let errors = 0;
+  function stopWithFailure() {
+    document.querySelectorAll('.card-figure-loading').forEach(function (holder) {
+      showFigureState(holder.dataset.figurePid, 'failed');
+    });
+    figurePollActive = false;
   }
   function poll() {
-    fetch('/digest/' + digestDate + '/figures-status')
-      .then(function (response) { return response.json(); })
+    if (document.hidden) { figurePollActive = false; return; }
+    const controller = new AbortController();
+    const timeout = setTimeout(function () { controller.abort(); }, 15000);
+    fetch('/digest/' + figureDigestDate + '/figures-status', {signal: controller.signal})
+      .then(function (response) { clearTimeout(timeout); if (!response.ok) throw new Error('Status unavailable'); return response.json(); })
       .then(function (status) {
-        Object.keys(status.figures || {}).forEach(function (pid) {
-          fillHolder(pid, status.figures[pid]);
+        errors = 0;
+        Object.keys(status.figures || {}).forEach(function (pid) { fillFigure(pid, status.figures[pid]); });
+        Object.keys(status.failed || {}).forEach(function (pid) {
+          if (!(status.figures || {})[pid]) showFigureState(pid, status.failed[pid] === 'no_figure' ? 'unavailable' : 'failed');
         });
-        // Keep polling while the fetch runs or unfilled placeholders remain
-        // (a rating upgrade can queue work after the current run ends).
-        if ((status.running || document.querySelector('.card-figure-loading')) && --remaining > 0) {
-          setTimeout(poll, 4000);
-        } else { finish(); figurePollActive = false; }
+        if (status.running || status.busy) setTimeout(poll, 4000);
+        else stopWithFailure();
+        layoutFigures();
       })
       .catch(function () {
-        if (--remaining <= 0) { finish(); figurePollActive = false; return; }
-        setTimeout(poll, 4000);
+        clearTimeout(timeout);
+        if (++errors >= 3) { stopWithFailure(); return; }
+        setTimeout(poll, 4000 * errors);
       });
   }
   poll();
 }
+document.addEventListener('visibilitychange', function () { if (!document.hidden) startFigurePolling(); });
+window.addEventListener('focus', startFigurePolling);
+document.addEventListener('error', function (event) {
+  const img = event.target;
+  if (img.tagName === 'IMG' && img.closest('.card-figure')) showFigureState(img.closest('.card-figure').dataset.figurePid, 'failed');
+}, true);
+// A cached image may have failed before the error listener was registered.
+document.querySelectorAll('.card-figure img').forEach(function (img) {
+  if (img.complete && !img.naturalWidth) showFigureState(img.closest('.card-figure').dataset.figurePid, 'failed');
+});
+document.addEventListener('click', function (event) {
+  const button = event.target.closest('[data-figure-retry]');
+  if (!button) return;
+  const pid = button.closest('[data-figure-pid]').dataset.figurePid;
+  button.disabled = true;
+  fetch('/digest/' + figureDigestDate + '/figures-retry', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paper_id: pid})
+  }).then(function (response) {
+    if (response.status === 409) { button.textContent = 'Busy — retry shortly'; button.disabled = false; return; }
+    if (!response.ok) throw new Error('Retry failed');
+    showFigureState(pid, 'pending');
+    startFigurePolling();
+  }).catch(function () { showFigureState(pid, 'failed'); });
+});
 {% if figure_pending or figure_backfill_active %}
 startFigurePolling();
 {% endif %}
@@ -3645,14 +3687,16 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .header h1{font-size:22px;margin-bottom:4px}
 .header .stats{color:#8899aa;font-size:14px}
 .sticky-wrapper{position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-.toolbar{background:#fff;padding:10px 32px;border-bottom:1px solid #e0e0e0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;row-gap:8px;overflow-x:visible}
-.toolbar button{height:36px;padding:0 16px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;display:inline-flex;align-items:center;justify-content:center;line-height:1;box-sizing:border-box}
-.btn-refresh{background:#3498db;color:#fff}.btn-refresh:hover{background:#2980b9}
-.btn-nav{background:#ecf0f1;color:#555}.btn-nav:hover{background:#dfe6e9}
-.no-data{text-align:center;padding:80px 20px;color:#999}
-.no-data h2{font-size:20px;color:#666;margin-bottom:12px;white-space:pre-line;line-height:1.5}
-.no-data p{font-size:14px;margin-bottom:24px}
-.no-data a{color:#3498db;text-decoration:none}
+.no-data{text-align:center;padding:100px 24px 64px;color:#7b8492;max-width:640px;margin:auto}
+.no-data h2{font-size:22px;font-weight:600;color:#364152;margin-bottom:12px;line-height:1.4}
+.no-data p{font-size:14px;line-height:1.6;margin-bottom:24px}
+.empty-actions{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+.empty-actions a,.empty-actions button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:9px 16px;border-radius:7px;font:500 13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-decoration:none;cursor:pointer}
+.empty-primary{background:#2563eb;color:#fff;border:1px solid #2563eb}
+.empty-primary:hover{background:#1d4ed8}
+.empty-secondary{background:transparent;color:#64748b;border:1px solid #cbd5e1}
+.empty-secondary:hover{background:#e8edf3}
+.empty-actions :focus-visible{outline:2px solid #2563eb;outline-offset:3px}
 .date-display{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 12px;box-sizing:border-box;font-size:16px;font-weight:600;color:#fff;cursor:pointer;border-radius:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);line-height:1;user-select:none}
 .date-display:hover{background:rgba(255,255,255,.2)}
 .date-arrow{display:inline-flex;align-items:center;justify-content:center;height:34px;width:34px;padding:0;box-sizing:border-box;background:rgba(255,255,255,.12);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;line-height:1}
@@ -3677,17 +3721,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     </div>
   </div>
 </div>
-<div class="toolbar">
-  <button class="btn-refresh" onclick="if(!confirm('Run the pipeline for this date? This may consume LLM API credits.'))return;location.href='/run?date={{ selected_date }}'" title="Re-run pipeline">&#x21bb;</button>
-  <span style="font-size:13px;color:#666">No data available</span>
 </div>
-</div>
-<div class="no-data">
-  <h2>{% if custom_message %}{{ custom_message }}{% elif is_update_day %}No digest for {{ selected_date }}{% else %}No arxiv update on {{ selected_date }}{% endif %}</h2>
-  <p>{% if custom_message %}Use the date picker to browse other dates, or click &#x21bb; to re-run.{% elif is_update_day %}No papers have been fetched for this date yet.{% else %}Arxiv does not announce papers on weekends or holidays.{% endif %}</p>
-  {% if is_update_day and not custom_message %}<button style="margin-top:28px;margin-bottom:24px;padding:14px 36px;font-size:16px;font-weight:600;color:#fff;background:#2563eb;border:none;border-radius:8px;cursor:pointer;box-shadow:0 2px 8px rgba(37,99,235,.3);transition:background .2s" onmouseover="this.style.background='#1d4ed8'" onmouseout="this.style.background='#2563eb'" onclick="location.href='/run?date={{ selected_date }}'">Generate Digest for {{ selected_date }}</button>{% endif %}
-  {% if available_dates %}<p style="font-size:12px;color:#aaa">Available: {{ available_dates | join(', ') }}</p>{% endif %}
-</div>
+{% set latest_date = latest_content_date() %}
+{% set can_generate = is_update_day and selected_date <= today_str %}
+<main class="no-data">
+  <h2>No digest for this date</h2>
+  <p>{{ 'Browse the latest digest or choose another date.' if latest_date else 'Choose another date or generate your first digest.' if can_generate else 'Choose another date.' }}</p>
+  <div class="empty-actions">
+    {% if latest_date %}<a class="empty-primary" href="/digest/{{ latest_date }}">View latest digest</a>{% endif %}
+    {% if can_generate %}<button class="{{ 'empty-secondary' if latest_date else 'empty-primary' }}" type="button" onclick="if(confirm('Generate this digest? This may use API credits.'))location.href='/run?date={{ selected_date }}'">Generate digest</button>{% endif %}
+  </div>
+</main>
 <script>
 function navigateToDate(dateStr) {
   if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return;
@@ -3861,6 +3905,23 @@ def _digest_status_map() -> dict:
     return result
 
 
+def _latest_content_date():
+    """The latest readable digest with actual papers, excluding empty files."""
+    for day in get_available_dates():
+        path = get_digest_path_for_date(day)
+        if not path:
+            continue
+        try:
+            if parse_digest(path).get("total_papers", 0) > 0:
+                return day
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+app.jinja_env.globals["latest_content_date"] = _latest_content_date
+
+
 # Shared UI assets for the calendar popover and settings entry, exposed to
 # every template via Jinja globals so no route needs to pass them explicitly.
 app.jinja_env.globals["calendar_snippet"] = _CALENDAR_SNIPPET
@@ -3945,6 +4006,7 @@ def _load_full_abstracts(date_str):
 _FIGURE_BACKFILL_WINDOW_DAYS = 60
 _figure_backfill_lock = Lock()
 _figure_backfill_state = {"running": False, "date": ""}
+_figure_backfill_queue = set()
 
 # A paper downgraded out of the 4-5 star range keeps its downloaded figures
 # for this many days (a re-upgrade cancels the deletion), then the cache is
@@ -3986,7 +4048,7 @@ def _figure_backfill_needed(candidates: list[str], sidecar: dict) -> bool:
         if pid in sidecar["failed"]:
             continue
         entry = sidecar["papers"].get(pid)
-        if entry is None:
+        if entry is None or not figure_path(_figures_dir(), pid):
             return True
         try:
             depth = int(entry.get("depth") or 1)
@@ -3999,7 +4061,7 @@ def _figure_backfill_needed(candidates: list[str], sidecar: dict) -> bool:
     return False
 
 
-def _start_figure_backfill(date_str: str) -> None:
+def _start_figure_backfill(date_str: str, retry_paper=None) -> bool:
     """Fetch missing figures for a digest in a background thread.
 
     The pass repeats (bounded) while work keeps appearing: a rating change
@@ -4011,12 +4073,21 @@ def _start_figure_backfill(date_str: str) -> None:
     """
     with _figure_backfill_lock:
         if _figure_backfill_state["running"]:
-            return
+            if retry_paper is None and _figure_backfill_state["date"] != date_str:
+                _figure_backfill_queue.add(date_str)
+            return False
         _figure_backfill_state["running"] = True
         _figure_backfill_state["date"] = date_str
 
     def run():
         try:
+            if retry_paper:
+                # An explicit retry must also recover a corrupt cached image.
+                delete_paper_figures(_figures_dir(), retry_paper)
+                sidecar = load_figure_sidecar(_digests_dir(), date_str)
+                sidecar["failed"].pop(retry_paper, None)
+                sidecar["papers"].pop(retry_paper, None)
+                write_figure_sidecar(_digests_dir(), date_str, sidecar)
             for _attempt in range(3):
                 digest_path = get_digest_path_for_date(date_str)
                 if not digest_path:
@@ -4039,14 +4110,18 @@ def _start_figure_backfill(date_str: str) -> None:
                     digest_dir=_digests_dir(),
                     digest_date=date_str,
                 )
-        except Exception:
-            pass  # figures are cosmetic; a failed backfill just leaves placeholders
+        except Exception as exc:
+            app.logger.warning("Figure backfill failed for %s: %s", date_str, type(exc).__name__)
         finally:
             with _figure_backfill_lock:
                 _figure_backfill_state["running"] = False
                 _figure_backfill_state["date"] = ""
+                next_date = _figure_backfill_queue.pop() if _figure_backfill_queue else None
+            if next_date:
+                _start_figure_backfill(next_date)
 
     Thread(target=run, daemon=True, name="figure-backfill").start()
+    return True
 
 
 # --- Figure retention ------------------------------------------------------
@@ -4313,25 +4388,10 @@ def _render_digest(digest=None):
         d["date"] = today_str
     # Handle empty digests (0 papers)
     if d["total_papers"] == 0:
-        status = d.get("status", "no_papers")
-        is_today = (d.get("date", "") == today_str)
-        if status == "no_announcement":
-            msg = "No arXiv announcement on this day (no weekend announcements / holiday deferral)"
-        elif status == "deferred_or_lagging":
-            msg = "This day's batch may be deferred (holiday) or the listing lags; no content yet"
-        elif is_today and status == "no_papers":
-            msg = _NOT_YET_AVAILABLE_MESSAGE
-        elif is_today and status == "no_new_papers":
-            msg = "No new papers since last digest"
-        else:
-            msg = "No papers available for this date"
-        available = get_available_dates()
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=d.get("date", today_str),
             today_str=today_str,
-            available_dates=available,
-            custom_message=msg,
             is_update_day=_is_arxiv_update_day(d.get("date", today_str))
         )
     prefs = load_preferences()
@@ -4393,6 +4453,7 @@ def _render_digest(digest=None):
         full_abstracts=full_abstracts,
         reason_html=reason_html,
         figure_map=figure_map,
+        figure_failures=figure_sidecar["failed"],
         figure_pending=figure_pending,
         figure_backfill_active=figure_backfill_active,
         star_display=_star_display,
@@ -4441,6 +4502,7 @@ def setup_submit():
         config, env_values,
         enable_email=request.form.get("enable_email") == "on",
         email_address=request.form.get("email_address", "").strip(),
+        email_recipients=request.form.get("email_recipients"),
         smtp_server=request.form.get("smtp_server", "").strip(),
         smtp_protocol=request.form.get("smtp_protocol", "ssl"),
         smtp_port_value=request.form.get("smtp_port", "").strip(),
@@ -4488,6 +4550,7 @@ def settings_save():
         config, env_values,
         enable_email=request.form.get("enable_email") == "on",
         email_address=request.form.get("email_address", "").strip(),
+        email_recipients=request.form.get("email_recipients"),
         smtp_server=request.form.get("smtp_server", "").strip(),
         smtp_protocol=request.form.get("smtp_protocol", "ssl"),
         smtp_port_value=request.form.get("smtp_port", "").strip(),
@@ -4615,13 +4678,10 @@ def index():
             return _render_digest(digest)
     # Nothing available
     today_str = _digest_today_str()
-    _, auto_message = _automatic_fetch_gate(today_str)
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=today_str,
         today_str=today_str,
-        available_dates=available,
-        custom_message=auto_message,
         is_update_day=_is_arxiv_update_day(today_str)
     )
 
@@ -4648,13 +4708,11 @@ def digest_by_date(date_str):
         return _render_digest(digest)
     # No digest for this date
     today_str = _digest_today_str()
-    available = get_available_dates()
     # Future dates: show no-update page, do NOT auto-run
     if date_str > today_str:
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=date_str,
-            available_dates=available,
             today_str=today_str,
             is_update_day=_is_arxiv_update_day(date_str)
         )
@@ -4676,15 +4734,12 @@ def digest_by_date(date_str):
         return render_template_string(
             NO_DIGEST_TEMPLATE,
             selected_date=date_str,
-            available_dates=available,
             today_str=today_str,
-            custom_message=_pipeline_message,
             is_update_day=_is_arxiv_update_day(date_str),
         )
     return render_template_string(
         NO_DIGEST_TEMPLATE,
         selected_date=date_str,
-        available_dates=available,
         today_str=today_str,
         is_update_day=_is_arxiv_update_day(date_str)
     )
@@ -4713,8 +4768,32 @@ def digest_figures_status(date_str):
             _figure_backfill_state["running"]
             and _figure_backfill_state["date"] == date_str
         )
+        queued = date_str in _figure_backfill_queue
     sidecar = load_figure_sidecar(_digests_dir(), date_str)
-    return jsonify({"running": running, "figures": sidecar["papers"]})
+    return jsonify({"running": running, "busy": queued,
+                    "figures": sidecar["papers"], "failed": sidecar["failed"]})
+
+
+@app.route("/digest/<date_str>/figures-retry", methods=["POST"])
+def retry_digest_figure(date_str):
+    try:
+        date.fromisoformat(date_str)
+    except ValueError:
+        abort(404)
+    digest_path = get_digest_path_for_date(date_str)
+    if not digest_path:
+        abort(404)
+    digest = parse_digest(digest_path)
+    apply_to_digest(digest, date_str)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400)
+    pid = payload.get("paper_id")
+    if not isinstance(pid, str) or pid not in _figure_candidates(digest):
+        abort(404)
+    if not _start_figure_backfill(date_str, retry_paper=pid):
+        return jsonify({"error": "Figure loading is busy"}), 409
+    return jsonify({"status": "pending"}), 202
 
 
 @app.route("/status")

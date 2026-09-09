@@ -80,7 +80,7 @@ def verify_bundle(bundle, window=False):
                         for route, expected in (
                             ("/", b"AstroPaperDigest"),
                             ("/setup", b"AstroPaperDigest"),
-                            ("/settings", b"Send/Receive Email"),
+                            ("/settings", b"Recipients"),
                             ("/static/mathjax/config.js", b"MathJax"),
                         ):
                             with opener.open(base + route, timeout=3) as response:
