@@ -1,4 +1,4 @@
-# AstroPaperDigest
+# Astro Digest
 
 [English](README.md)
 
@@ -14,7 +14,7 @@
 
 ## 开始使用
 
-1. 从 [Releases](https://github.com/jiangrz77/AstroPaperDigest/releases/latest) 下载最新 **DMG**，将应用拖入 **Applications**。
+1. 从 [Releases](https://github.com/jiangrz77/AstroDigest/releases/latest) 下载最新 **DMG**，将应用拖入 **Applications**。
 2. 打开应用，配置 API 密钥和研究兴趣。
 3. 浏览每日 Digest；在设置中调整兴趣画像或启用邮件通知。
 
