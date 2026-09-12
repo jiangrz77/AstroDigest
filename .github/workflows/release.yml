@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -10,31 +13,48 @@ permissions:
 jobs:
   build-and-release:
     runs-on: macos-14   # Apple Silicon (arm64). For Intel support add macos-13 to a matrix.
+    env:
+      ASTRODIGEST_RELEASE_BUILD: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # release.sh needs the triggering tag
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"   # OpenSSL 3.x (LibreSSL-free TLS)
+
+      - name: Reject moved release tags
+        if: startsWith(github.ref, 'refs/tags/') && github.event.forced == true
+        run: |
+          echo "Release tags are immutable. Publish the fix under a new version."
+          exit 1
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r AstroPaperDigest/requirements.txt
-          pip install pyinstaller
-          pip install pytest
+          pip install --require-hashes -r AstroDigest/requirements-release.lock
+          pip check
+          python -m playwright install chromium
 
       - name: Run offline regression tests
-        working-directory: AstroPaperDigest
-        run: python -m pytest tests -q -k 'not full_pipeline_dry_run'
+        working-directory: AstroDigest
+        run: |
+          python -m pytest tests -q -k 'not full_pipeline_dry_run'
+          node tests/test_figure_polling.js
+
+      - name: Verify packaged build before tagging
+        if: startsWith(github.ref, 'refs/tags/') == false
+        working-directory: AstroDigest
+        run: ./build_dmg.sh
 
       - name: Build release artifacts (app + dmg + source/app zips + version.json)
-        working-directory: AstroPaperDigest
+        working-directory: AstroDigest
+        if: startsWith(github.ref, 'refs/tags/')
         run: ./release.sh
 
       - name: Generate release notes with SHA-256 checksums
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}   # gh does not read GITHUB_TOKEN automatically
         run: |
@@ -44,30 +64,41 @@ jobs:
           # resolves to the commit sha and /git/tags/<sha> 404s (killed the
           # v2.3.0 release under set -e).
           if REF_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha' 2>/dev/null)" \
-             && gh api "repos/$GITHUB_REPOSITORY/git/tags/$REF_SHA" --jq '.message' > /tmp/release-body.md 2>/dev/null; then
+             && gh api "repos/$GITHUB_REPOSITORY/git/tags/$REF_SHA" --jq '.message' > /tmp/release-tag-notes.md 2>/dev/null; then
             :
           else
             # lightweight tag or API hiccup: fall back to the tag name
-            echo "$GITHUB_REF_NAME" > /tmp/release-body.md
+            echo "$GITHUB_REF_NAME" > /tmp/release-tag-notes.md
           fi
           {
             echo ""
             echo "## Checksums (SHA-256)"
-            # .app.zip FIRST: the in-app updater verifies against the first
-            # SHA-256 it finds in the release body.
-            for f in AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip \
-                     AstroPaperDigest/dist/AstroPaperDigest-*.dmg; do
+            # Keep app checksums before source checksums and annotated tag
+            # notes: older installed apps take the first SHA-256 in the body.
+            for f in AstroDigest/dist/AstroDigest-v*.app.zip \
+                     AstroDigest/dist/AstroDigest-v*.source.zip \
+                     AstroDigest/dist/AstroDigest-*.dmg \
+                     AstroDigest/dist/AstroPaperDigest-v*.app.zip \
+                     AstroDigest/dist/AstroPaperDigest-v*.source.zip; do
               echo "- $(basename "$f")"
               echo "  SHA256: $(shasum -a 256 "$f" | awk '{print $1}')"
             done
-          } >> /tmp/release-body.md
+            echo ""
+            cat /tmp/release-tag-notes.md
+          } > /tmp/release-body.md
           cat /tmp/release-body.md
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: /tmp/release-body.md
-          # dmg + whole-bundle update package (in-app hot update)
-          files: |
-            AstroPaperDigest/dist/AstroPaperDigest-v*.app.zip
-            AstroPaperDigest/dist/AstroPaperDigest-*.dmg
+      - name: Publish GitHub release without replacing an existing version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release-body.md \
+            AstroDigest/dist/AstroDigest-v*.app.zip \
+            AstroDigest/dist/AstroDigest-v*.source.zip \
+            AstroDigest/dist/AstroDigest-*.dmg \
+            AstroDigest/dist/AstroPaperDigest-v*.app.zip \
+            AstroDigest/dist/AstroPaperDigest-v*.source.zip \
+            AstroDigest/dist/version.json \
+            AstroDigest/dist/SHA256SUMS

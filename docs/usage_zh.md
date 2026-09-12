@@ -12,12 +12,14 @@
 
 - 即使当天没有 5 星论文，也会发送一封日报邮件；
 - 邮件包含所有 5 星论文的标题、评分、推荐理由、作者、分类、arXiv 链接和完整摘要；
-- 4 星及以下论文的详细内容请在 AstroPaperDigest App 中查看；
+- 4 星及以下论文的详细内容请在 Astro Digest App 中查看；
 - 同一日期默认只发送一次，Settings 中可手动重发最近日报，命令行也可使用 `send_digests.py --resend YYYY-MM-DD`；
 - 邮件同时包含 HTML 和纯文本版本，并通过邮件线程头信息尽量让每日更新集中显示在同一组会话中；
-- 邮件中的 App 链接在 App 未运行时会通过 `astropaperdigest://` 启动 App，并打开对应日期。
+- 邮件中的 App 链接在 App 未运行时会通过 `astrodigest://` 启动 App，并打开对应日期。
 
 建议使用邮箱服务商提供的 **App Password**，不要填写主账号密码。密码只保存在本机 App 支持目录中，不会在设置页回显。
+
+旧邮件中的 `astropaperdigest://` 链接仍可在 Astro Digest 中打开对应日报。
 
 ## 使用 Zotero 文献库
 
@@ -47,7 +49,7 @@ zotero_db: ~/Zotero/zotero.sqlite
 ### 安装步骤
 
 1. 双击 **`Install.command`** —— 自动配置 Python 环境并构建应用
-2. 双击 **`AstroPaperDigest.app`** —— 原生桌面窗口自动打开
+2. 双击 **`Astro Digest.app`** —— 原生桌面窗口自动打开
 
 > **macOS 安全提示？** 前往 **系统设置 → 隐私与安全性**，点击 **"仍要打开"**。仅需操作一次。
 
@@ -56,6 +58,12 @@ zotero_db: ~/Zotero/zotero.sqlite
 - **检查时机**：应用启动时自动在后台检查一次（网络失败静默），也可在 **设置页（⛭）→ General → Update** 手动点击「Check for Updates」。
 - **推送提示**：发现新版本时，Digest 页顶部显示蓝色横幅；设置页的 Update 分组显示当前/最新版本与更新日志。
 - **安装流程**（半自动）：在设置页点击「Download Update」→ 下载完成后自动做 SHA-256 校验 → 点击「Install & Restart」→ 自动备份旧代码、替换源码、重建 .app 并重新打开。
-- **更新源**：GitHub Releases（公开仓库）。检查接口：`https://api.github.com/repos/jiangrz77/AstroPaperDigest/releases/latest`。
+- **更新源**：GitHub Releases（公开仓库）。检查接口：`https://api.github.com/repos/jiangrz77/AstroDigest/releases/latest`。
 - **版本号**：单一版本源 `version.txt`（构建 .app 时由 `build_app.sh` 读取）。
 - **保留文件**：更新不会覆盖 `.env`、`config.yaml`、`preferences.json`、`feedback.json`、`data/`、`output/`、`.venv`；旧代码自动备份到 `backups/`。
+
+## 旧版本兼容
+
+全新安装的数据位于 `~/Library/Application Support/AstroDigest`。如果原来的 `~/Library/Application Support/AstroPaperDigest` 目录已存在，新版本会继续使用它，保留配置、历史日报、反馈及邮件发送记录；源码运行时数据仍保存在 `main.py` 所在目录。新旧名称的日报标题都能正常读取。
+
+macOS 应用标识和旧的单实例文件名保持稳定。自动更新可以替换安装在旧名称路径下的应用；下载新版 DMG 可直接获得 `Astro Digest.app`。应用包内部的可执行文件仍为 `AstroDigest`，用于保持更新和 macOS 应用身份兼容。

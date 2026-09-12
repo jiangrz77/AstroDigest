@@ -1,0 +1,6 @@
+# Release environment: macOS arm64, Python 3.12.
+-r requirements.txt
+pyinstaller
+pytest
+
+playwright
