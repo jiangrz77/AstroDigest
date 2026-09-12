@@ -87,6 +87,14 @@ class DigestBrandingTests(unittest.TestCase):
             self.assertEqual(settings["github_repo"], expected)
             self.assertTrue(settings["extra_option"])
 
+    def test_update_banner_placeholders_are_before_page_content(self):
+        banner = "<!-- ASTRODIGEST_UPDATE_BANNER -->"
+        self.assertLess(gui.SETTINGS_TEMPLATE.index(banner), gui.SETTINGS_TEMPLATE.index('<div class="layout">'))
+        self.assertLess(gui.DIGEST_TEMPLATE.index(banner), gui.DIGEST_TEMPLATE.index('<div class="container">'))
+        self.assertLess(gui.NO_DIGEST_TEMPLATE.index(banner), gui.NO_DIGEST_TEMPLATE.index('<main class="no-data">'))
+        self.assertIn("New version v", gui._UPDATE_BANNER_SCRIPT)
+        self.assertIn("Update Now", gui._UPDATE_BANNER_SCRIPT)
+
 
 if __name__ == "__main__":
     unittest.main()

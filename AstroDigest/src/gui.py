@@ -153,7 +153,7 @@ _update_state = {
 _update_lock = Lock()
 
 _UPDATE_BANNER_SCRIPT = """
-<div id="astrodigest-update-banner" style="display:none;background:#2563eb;color:#fff;padding:10px 20px;font-size:13px;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap">
+<div id="astrodigest-update-banner" style="display:none;width:100%;box-sizing:border-box;background:#2563eb;color:#fff;padding:10px 32px;font-size:13px;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;text-align:left">
   <span id="astrodigest-update-text"></span>
   <a id="astrodigest-update-view" href="/settings#update" style="color:#fff;font-weight:600;text-decoration:underline">View</a>
   <button id="astrodigest-update-now" style="background:#fff;color:#2563eb;border:none;border-radius:6px;padding:5px 14px;font-weight:600;cursor:pointer">Update Now</button>
@@ -161,7 +161,7 @@ _UPDATE_BANNER_SCRIPT = """
 </div>
 <script>
 (function () {
-  var STORAGE_KEY = "apdUpdateDismissed";
+  var STORAGE_KEY = "astrodigestUpdateDismissed";
   function showBanner(s) {
     var bar = document.getElementById("astrodigest-update-banner");
     if (!bar) return;
@@ -757,16 +757,16 @@ def check_setup():
 
 @app.after_request
 def inject_update_banner(response):
-    """Attach the update banner to every rendered page."""
+    """Place the update banner at the top of pages that opt into it."""
     if response.mimetype == "text/html":
         # Digest pages change server-side (feedback adjustments re-render
         # scores/colours); a webview cache would show stale colours after a
         # reload, so never let HTML be cached.
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         content = response.get_data(as_text=True)
-        if "</body>" in content:
-            inject = f"{_UPDATE_BANNER_SCRIPT}\n</body>"
-            response.set_data(content.replace("</body>", inject, 1))
+        marker = "<!-- ASTRODIGEST_UPDATE_BANNER -->"
+        if marker in content:
+            response.set_data(content.replace(marker, _UPDATE_BANNER_SCRIPT, 1))
     return response
 
 
@@ -1610,6 +1610,7 @@ textarea{height:90px;resize:vertical}
 <div class="header">
   <h1><img src="/static/brand-mark.svg" alt="" style="vertical-align:middle;margin-right:6px" width="20" height="20">Astro Digest - Settings</h1>
 </div>
+<!-- ASTRODIGEST_UPDATE_BANNER -->
 <div class="layout">
   <nav class="sidebar">
     <div class="sidebar-nav">
@@ -2673,6 +2674,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </span>
 </div>
 </div>
+<!-- ASTRODIGEST_UPDATE_BANNER -->
 <div class="container">
 <div class="search-empty" id="search-empty" hidden>No matching papers</div>
 {% for tier in digest.tiers %}
@@ -3734,6 +3736,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
 </div>
 </div>
+<!-- ASTRODIGEST_UPDATE_BANNER -->
 {% set latest_date = latest_content_date() %}
 {% set can_generate = is_update_day and selected_date <= today_str %}
 <main class="no-data">
