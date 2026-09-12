@@ -1,4 +1,4 @@
-# AstroPaperDigest
+# Astro Digest
 
 [中文](README_zh.md)
 
@@ -14,7 +14,7 @@ Your daily astrophysics reading list, ranked by how closely each paper matches y
 
 ## Get started
 
-1. Download the latest **DMG** from [Releases](https://github.com/jiangrz77/AstroPaperDigest/releases/latest) and drag the app into **Applications**.
+1. Download the latest **DMG** from [Releases](https://github.com/jiangrz77/AstroDigest/releases/latest) and drag the app into **Applications**.
 2. Open the app and set up your API key and research interests.
 3. Browse your daily digest; use Settings to adjust your profile or enable email.
 
